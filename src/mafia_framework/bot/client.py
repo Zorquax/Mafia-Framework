@@ -14,10 +14,13 @@ from ..io.ingestion import ingest_log
 logger = logging.getLogger("mafia_bot.client")
 
 VOTE_TARGET_RE = re.compile(r"(?P<voter>.+?)\s+(?:has\s+)?voted(?:\s+for)?\s+(?P<target>.+?)(?:\.|$)", re.IGNORECASE)
-VOTE_SOURCE_RE = re.compile(r"(?P<voter>.+?)\s+(?:has\s+)?voted(?:\s+for)?\s+(?P<target>.+?)(?:\.|$)", re.IGNORECASE)
 
 # Matches the role-assignment PM, e.g. "zorq_bot, you are a Vanilla Townie"
 OWN_ROLE_PM_RE = re.compile(r"^(?P<name>.+?),\s*you\s+are\s+an?\s+(?P<role>.+?)\.?\s*$", re.IGNORECASE)
+
+# Matches the private "/mafia role" query response, e.g.
+# |c|~|/raw <div class="infobox">Your role is: Mafia Goon</div>
+OWN_ROLE_BOX_RE = re.compile(r"Your\s+role\s+is:?\s*(?P<role>.+?)</div>", re.IGNORECASE)
 
 # Roles the bot should claim VT (Vanilla Townie) for instead of its real role.
 LIE_AS_VT_ROLE_RE = re.compile(r"\b(werewolf|alien|cult\w*|serial\s+killer|goo)\b", re.IGNORECASE)
@@ -60,17 +63,6 @@ class MafiaBot:
         return line
 
     @staticmethod
-    def _extract_vote_voter(line: str) -> Optional[str]:
-        from ..io.player_names import canonical_player_name
-
-        message_text = MafiaBot._message_text_from_line(line)
-        match = VOTE_SOURCE_RE.search(message_text)
-        if not match:
-            return None
-        voter = canonical_player_name(match.group("voter"))
-        return voter or None
-
-    @staticmethod
     def _is_vote_for_bot(line: str, bot_username: str) -> bool:
         from ..io.player_names import canonical_player_name, names_match
 
@@ -81,6 +73,17 @@ class MafiaBot:
 
         target = canonical_player_name(match.group("target"))
         return bool(target) and names_match(target, bot_username)
+
+    @staticmethod
+    def _parse_own_role_box(line: str) -> Optional[str]:
+        """Parses the private "/mafia role" query response, e.g.
+        |c|~|/raw <div class="infobox">Your role is: Mafia Goon</div>
+        """
+        match = OWN_ROLE_BOX_RE.search(line)
+        if not match:
+            return None
+        role_text = re.sub(r"<[^>]*>", "", match.group("role")).strip()
+        return role_text or None
 
     def _get_strategy_vote(self, session) -> tuple[Optional[str], float]:
         return self.strategy.get_vote_decision(
@@ -260,6 +263,8 @@ class MafiaBot:
                 await self.send_room_command("/mafia join")
         elif self.tracker.state == "DAY":
             logger.info("Backlog indicates game is in progress (DAY phase).")
+            if self.tracker.in_game and not self._own_role:
+                await self.send_room_command("/mafia role")
             if not self._random_actions_task or self._random_actions_task.done():
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
             if not self._random_vote_task or self._random_vote_task.done():
@@ -290,6 +295,11 @@ class MafiaBot:
                 
                 # Only process messages from the target room
                 if room.lower() == self.connection.room.lower():
+                    role_from_box = self._parse_own_role_box(line)
+                    if role_from_box:
+                        self._own_role = role_from_box
+                        logger.info(f"Learned own role from /mafia role response: {self._own_role}")
+
                     event = self.tracker.process_message(line, bot_username=self.config.showdown.username)
                     self._maybe_remember_chat_line(line)
                     if event == "SIGNUPS" and self.config.gameplay.autojoin:
@@ -302,10 +312,6 @@ class MafiaBot:
                         await asyncio.sleep(delay)
                         catchphrases = ["why me", "im town", "get off", "bruh", "they're gonna qh"]
                         await self._send_chat_message(random.choice(catchphrases))
-                        voter = self._extract_vote_voter(line)
-                        if voter:
-                            logger.info(f"Voting back on {voter} after being voted")
-                            await self.send_room_command(f"/mafia vote {voter}")
 
                     if (
                         self._ready_for_live_games
@@ -344,6 +350,8 @@ class MafiaBot:
             self._current_town_read = None
             self._own_role = None
             self._claimed_this_day = False
+            if self.tracker.in_game:
+                await self.send_room_command("/mafia role")
             if not self._random_actions_task or self._random_actions_task.done():
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
             if not self._random_vote_task or self._random_vote_task.done():
@@ -719,41 +727,44 @@ class MafiaBot:
                 await self.connection.send(f"|/pm {clean_sender}, no one")
             return
 
-        if self.tracker.in_game and not self.tracker.eliminated and any(token in msg.lower() for token in ["claim", "claiming"]):
-            claim_message = self._get_claim_message()
-            if claim_message:
-                logger.info(f"Responding to claim PM from {clean_sender} with {claim_message}")
-                await self.connection.send(f"|/pm {clean_sender}, {claim_message}")
-            else:
-                logger.info(f"No claim message available for PM from {clean_sender}")
-                await self.connection.send(f"|/pm {clean_sender}, unknown")
-            return
-        
-        # Command parsing:
-        # !vote [player] -> override vote
-        # !multiplier [player] [value] -> multiplier
-        # !reset -> clear overrides
-        # !reads -> full ranked mafia-probability list for every live player
+        # Command parsing (uses a "." prefix, not "!" -- "!" is reserved for
+        # staff broadcast commands on Showdown and gets intercepted):
+        # .vote [player] -> override vote
+        # .multiplier [player] [value] -> multiplier
+        # .reset -> clear overrides
+        # .reads -> full ranked mafia-probability list for every live player
+        # .claim -> this game's v-1 claim message
         parts = msg.strip().split()
         if not parts:
             return
 
         cmd = parts[0].lower()
-        if cmd == "!reads":
+        if cmd == ".claim":
+            if self.tracker.in_game and not self.tracker.eliminated:
+                claim_message = self._get_claim_message()
+                if claim_message:
+                    logger.info(f"Responding to claim PM from {clean_sender} with {claim_message}")
+                    await self.connection.send(f"|/pm {clean_sender}, {claim_message}")
+                else:
+                    logger.info(f"No claim message available for PM from {clean_sender}")
+                    await self.connection.send(f"|/pm {clean_sender}, unknown")
+            return
+
+        if cmd == ".reads":
             session = self.tracker.get_game_session()
             predictions = self._get_strategy_full_predictions(session)
             await self.connection.send(f"|/pm {clean_sender}, {self._format_reads_message(predictions)}")
             return
 
-        if cmd == "!vote" and len(parts) > 1:
+        if cmd == ".vote" and len(parts) > 1:
             target = parts[1]
             self.strategy.set_manual_vote(target)
             await self.connection.send(f"|/pm {clean_sender}, Manual vote set to: {target}")
             # Trigger immediate vote update if in game
             if self.tracker.state == "DAY":
                 await self._evaluate_and_vote()
-                
-        elif cmd == "!multiplier" and len(parts) > 2:
+
+        elif cmd == ".multiplier" and len(parts) > 2:
             target = parts[1]
             try:
                 val = float(parts[2])
@@ -764,8 +775,8 @@ class MafiaBot:
                     await self._evaluate_and_vote()
             except ValueError:
                 await self.connection.send(f"|/pm {clean_sender}, Invalid multiplier value. Must be float.")
-                
-        elif cmd == "!reset":
+
+        elif cmd == ".reset":
             self.strategy.reset()
             await self.connection.send(f"|/pm {clean_sender}, Reset bot override states.")
             if self.tracker.state == "DAY":

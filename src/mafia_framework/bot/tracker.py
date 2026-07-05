@@ -118,8 +118,29 @@ class GameTracker:
         # Save raw line in global history
         self.raw_text_history.append(line)
 
+        # Determine whether this line actually came from the room/server
+        # ("~") rather than a real player, so phase/state transitions can
+        # only ever be driven by genuine system announcements -- never by a
+        # player simply typing something that happens to resemble one (e.g.
+        # "lol night 2 has begun already" or "the town has won this fr").
+        parts = line.split("|")
+        if len(parts) > 3 and parts[1] == "c:":
+            is_system_message = parts[3] == "~"
+        elif len(parts) > 2 and parts[1] == "c":
+            is_system_message = parts[2] == "~"
+        else:
+            is_system_message = True
+
         # Parse contents of the message
         clean_text = self._normalize_message_text(line)
+
+        if not is_system_message:
+            # Still accumulate for later message-content parsing (tells,
+            # votes typed in chat, etc.), but never let player chat drive
+            # phase/state transitions.
+            if self.state in {"DAY", "NIGHT"}:
+                self.accumulated_lines.append(line)
+            return None
 
         # If we are in IDLE or SIGNUPS, check for signup start
         if self.state == "IDLE" and SIGNUPS_START_RE.search(clean_text):

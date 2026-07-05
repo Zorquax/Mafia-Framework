@@ -416,7 +416,7 @@ class TestBotComponents(unittest.TestCase):
         bot.connection.send = AsyncMock()
         bot._own_role = "Cult Leader"
 
-        asyncio.run(bot._handle_pm("Alice", "claim"))
+        asyncio.run(bot._handle_pm("Alice", ".claim"))
 
         bot.connection.send.assert_awaited_once_with("|/pm Alice, VT 1 to hammer")
 
@@ -432,6 +432,14 @@ class TestBotComponents(unittest.TestCase):
 
         self.assertEqual(bot._own_role, "Vanilla Townie")
         bot.connection.send.assert_not_awaited()
+
+    def test_parse_own_role_box_from_mafia_role_response(self):
+        # Real captured response to sending "/mafia role" in a live game.
+        line = '|c|~|/raw <div class="infobox">Your role is: Mafia Goon</div>'
+        self.assertEqual(MafiaBot._parse_own_role_box(line), "Mafia Goon")
+
+    def test_parse_own_role_box_returns_none_for_unrelated_line(self):
+        self.assertIsNone(MafiaBot._parse_own_role_box("|c:|123|Alice|hello everyone"))
 
     def test_handle_pm_ignores_own_echoed_messages(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -467,13 +475,9 @@ class TestBotComponents(unittest.TestCase):
         bot.connection = Mock()
         bot.connection.send = AsyncMock()
 
-        asyncio.run(bot._handle_pm("Host", "!reads"))
+        asyncio.run(bot._handle_pm("Host", ".reads"))
 
         bot.connection.send.assert_awaited_once_with("|/pm Host, Bob 82% | Alice 20%")
-
-    def test_extract_vote_voter_from_vote_message(self):
-        self.assertEqual(MafiaBot._extract_vote_voter("|c:|123|~|Alice has voted BotUser."), "Alice")
-        self.assertIsNone(MafiaBot._extract_vote_voter("|c:|123|~|Alice is chatting"))
 
     def test_question_prompt_ignores_players_after_elimination(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -529,6 +533,32 @@ class TestBotComponents(unittest.TestCase):
 
         tracker.process_message("Day 3. The hammer count is set at 4", bot_username="BotUser")
         self.assertEqual(tracker.hammer_count, 4)
+
+    def test_player_chat_cannot_fake_phase_transitions(self):
+        # Several phase-detection regexes have no anchor requiring them to
+        # start at a line boundary, so without a sender check, a player
+        # simply typing something that resembles a system announcement could
+        # falsely flip the tracker's state.
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["Alice", "Bob"]
+        tracker.in_game = True
+
+        cases = [
+            "|c:|123|Alice|lol night 2 has begun already",
+            "|c:|124|Bob|the town has won this fr no cap",
+            "|c:|125|Alice|**bold statement**",
+            "|c:|126|Bob|Day 5. The hammer count is set at 3",
+        ]
+        for line in cases:
+            event = tracker.process_message(line, bot_username="BotUser")
+            self.assertIsNone(event, msg=f"player chat should never produce an event: {line!r}")
+            self.assertEqual(tracker.state, "DAY", msg=f"player chat should never change state: {line!r}")
+
+        # A genuine system-authored message must still work.
+        event = tracker.process_message("|c:|127|~|Night 2 has begun.", bot_username="BotUser")
+        self.assertEqual(event, "NIGHT")
+        self.assertEqual(tracker.state, "NIGHT")
 
     def test_deadline_warnings_trigger_events_once_each(self):
         tracker = GameTracker()
