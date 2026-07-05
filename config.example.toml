@@ -1,0 +1,19 @@
+[showdown]
+server_url = "ws://sim3.psim.us/showdown/websocket"
+login_url = "https://play.pokemonshowdown.com/action.php"
+username = "your_bot_username"
+password = ""
+room = "mafia"
+
+[gameplay]
+autojoin = true
+min_confidence_to_vote = 0.55
+night_idle = true
+update_suspicion_frequency_seconds = 60.0
+min_seconds_between_vote_actions = 3.0
+random_vote_chance = 0.4
+
+[database]
+db_path = "data/mafia.db"
+model_path = "data/model.pkl"
+model_d1_path = "data/model_d1.pkl"
