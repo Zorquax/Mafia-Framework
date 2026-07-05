@@ -5,11 +5,17 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 # Python 3.11+ has tomllib, fall back to toml package for older versions if needed
 if sys.version_info >= (3, 11):
     import tomllib
 else:
     import toml as tomllib
+
+# Loads PS_USERNAME/PS_PASSWORD/PS_ROOM (and anything else) from a local
+# .env file into the environment, if one exists. Safe no-op otherwise.
+load_dotenv()
 
 
 @dataclass
@@ -56,16 +62,10 @@ class BotConfig:
                 if repo_candidate.exists():
                     candidate = repo_candidate
 
-        if not candidate.exists():
-            # Return default configs if file not found
-            return cls(
-                showdown=ShowdownConfig(),
-                gameplay=GameplayConfig(),
-                database=DatabaseConfig(),
-            )
-
-        with candidate.open("rb") as handle:
-            data = tomllib.load(handle)
+        data = {}
+        if candidate.exists():
+            with candidate.open("rb") as handle:
+                data = tomllib.load(handle)
 
         showdown_data = data.get("showdown", {})
         gameplay_data = data.get("gameplay", {})
