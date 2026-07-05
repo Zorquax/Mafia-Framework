@@ -9,10 +9,9 @@ room = "mafia"
 autojoin = true
 min_confidence_to_vote = 0.55
 night_idle = true
-min_seconds_between_vote_actions = 3.0
-random_vote_chance = 0.4
 vote_comment_chance = 0.5
 town_read_comment_chance = 0.5
+first_evaluation_delay_seconds = 60.0
 
 [database]
 db_path = "data/mafia.db"
