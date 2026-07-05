@@ -31,9 +31,13 @@ class BotStrategy:
     def _score_players(self, session: GameSession, bot_username: str, db_path: str) -> list[Tuple[str, float]]:
         """Returns [(player_name, adjusted_mafia_probability), ...] for all valid targets."""
         # Determine if we should use Day 1 model
-        # Use day_one model if current day is 1 and day_one model file exists
+        # Use day_one model if current day is 1 and day_one model file exists.
+        # A freshly-started day 1 has no messages/votes recorded yet -- that's
+        # still day 1, not evidence against it, so default to True when there's
+        # no data at all rather than treating "no data" as "not day one".
         from pathlib import Path
-        day_one = bool(session.messages) and all(m.day == 1 for m in session.messages)
+        known_days = [m.day for m in session.messages] + [v.day for v in session.votes]
+        day_one = all(day == 1 for day in known_days) if known_days else True
         model_to_use = self.model_d1_path if (day_one and Path(self.model_d1_path).exists()) else self.model_path
 
         if not Path(model_to_use).exists():
