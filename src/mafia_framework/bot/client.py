@@ -22,6 +22,8 @@ OWN_ROLE_PM_RE = re.compile(r"^(?P<name>.+?),\s*you\s+are\s+an?\s+(?P<role>.+?)\
 # Roles the bot should claim VT (Vanilla Townie) for instead of its real role.
 LIE_AS_VT_ROLE_RE = re.compile(r"\b(werewolf|alien|cult\w*|serial\s+killer|goo)\b", re.IGNORECASE)
 
+VALID_ALIGNMENTS = {"town", "mafia", "neutral", "unknown"}
+
 
 class MafiaBot:
     def __init__(self, config_path: str):
@@ -646,8 +648,35 @@ class MafiaBot:
             )
             logger.info(f"Successfully saved game to DB with id={game_id}")
             print(f">>> SAVED AS GAME ID {game_id}")
+            await self._prompt_for_undefined_roles(self.config.database.db_path, game_id)
         except Exception as e:
             logger.error(f"Failed to persist game to database: {e}")
+
+    async def _prompt_for_undefined_roles(self, db_path: str, game_id: int) -> None:
+        """Lets the host fill in roles for players who never flipped (e.g.
+        survivors), right at the terminal, instead of needing the dashboard.
+        """
+        from ..services.game_service import assign_player_role, find_undefined_players
+
+        loop = asyncio.get_running_loop()
+        undefined = await loop.run_in_executor(None, find_undefined_players, db_path, game_id)
+        if not undefined:
+            return
+
+        print(f"\n{len(undefined)} player(s) have no recorded role (likely survived to the end):")
+        for row in undefined:
+            hint = "has chat" if row.has_messages else "silent"
+            if row.is_inferred_town_candidate:
+                hint += ", inferred town"
+            prompt = f"  Role for {row.player_name} ({hint}) [town/mafia/neutral/unknown, blank=skip]: "
+            answer = (await loop.run_in_executor(None, input, prompt)).strip().lower()
+            if not answer:
+                continue
+            if answer not in VALID_ALIGNMENTS:
+                print(f"  Skipping {row.player_name}: {answer!r} is not a valid role.")
+                continue
+            assign_player_role(db_path, game_id, row.player_name, answer)
+            print(f"  Set {row.player_name} to {answer}.")
 
     async def _handle_pm(self, sender: str, msg: str):
         # Clean prefix decorator if any (e.g. %Host -> Host)

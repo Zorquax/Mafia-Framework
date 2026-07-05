@@ -10,6 +10,7 @@ from mafia_framework.bot.config import BotConfig
 from mafia_framework.bot.tracker import GameTracker
 from mafia_framework.bot.strategy import BotStrategy
 from mafia_framework.data.models import GameSession, Message, Vote, Flip, LogEvent
+from mafia_framework.services.game_service import UndefinedPlayerRow
 
 
 class TestBotComponents(unittest.TestCase):
@@ -590,3 +591,48 @@ class TestBotComponents(unittest.TestCase):
 
         self.assertEqual(target, "Alice")
         self.assertAlmostEqual(prob, 0.80)
+
+    def test_prompt_for_undefined_roles_assigns_valid_input(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        rows = [
+            UndefinedPlayerRow(game_id=1, display_name=None, player_name="Alice", has_messages=True, is_inferred_town_candidate=True),
+            UndefinedPlayerRow(game_id=1, display_name=None, player_name="Bob", has_messages=False, is_inferred_town_candidate=False),
+        ]
+
+        with (
+            patch("mafia_framework.services.game_service.find_undefined_players", return_value=rows),
+            patch("mafia_framework.services.game_service.assign_player_role") as mock_assign,
+            patch("builtins.input", side_effect=["town", "mafia"]),
+        ):
+            asyncio.run(bot._prompt_for_undefined_roles("dummy.db", 1))
+
+        mock_assign.assert_any_call("dummy.db", 1, "Alice", "town")
+        mock_assign.assert_any_call("dummy.db", 1, "Bob", "mafia")
+        self.assertEqual(mock_assign.call_count, 2)
+
+    def test_prompt_for_undefined_roles_skips_blank_and_invalid_input(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        rows = [
+            UndefinedPlayerRow(game_id=1, display_name=None, player_name="Alice", has_messages=True, is_inferred_town_candidate=False),
+            UndefinedPlayerRow(game_id=1, display_name=None, player_name="Bob", has_messages=True, is_inferred_town_candidate=False),
+        ]
+
+        with (
+            patch("mafia_framework.services.game_service.find_undefined_players", return_value=rows),
+            patch("mafia_framework.services.game_service.assign_player_role") as mock_assign,
+            patch("builtins.input", side_effect=["", "not_a_role"]),
+        ):
+            asyncio.run(bot._prompt_for_undefined_roles("dummy.db", 1))
+
+        mock_assign.assert_not_called()
+
+    def test_prompt_for_undefined_roles_noop_when_none_undefined(self):
+        bot = MafiaBot.__new__(MafiaBot)
+
+        with (
+            patch("mafia_framework.services.game_service.find_undefined_players", return_value=[]),
+            patch("builtins.input") as mock_input,
+        ):
+            asyncio.run(bot._prompt_for_undefined_roles("dummy.db", 1))
+
+        mock_input.assert_not_called()
