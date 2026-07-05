@@ -102,8 +102,8 @@ class TestBotComponents(unittest.TestCase):
         )
 
         strategy = BotStrategy(
-            model_path="data/model.pkl",
-            model_d1_path="data/model_d1.pkl",
+            model_path="nonexistent_model.pkl",
+            model_d1_path="nonexistent_model_d1.pkl",
             min_confidence=0.55
         )
 
@@ -115,7 +115,7 @@ class TestBotComponents(unittest.TestCase):
 
         # Manual override target not in roster should be ignored
         strategy.set_manual_vote("UnknownPlayer")
-        # Since dummy.db model path doesn't exist, it should return None
+        # Since the model path doesn't exist, it should return None
         target, prob = strategy.get_vote_decision(session, bot_username="BotUser", db_path="dummy.db")
         self.assertIsNone(target)
         self.assertEqual(prob, 0.0)
@@ -152,6 +152,35 @@ class TestBotComponents(unittest.TestCase):
 
         self.assertEqual(target, "Alice")
         self.assertAlmostEqual(prob, 0.95)
+
+    def test_strategy_get_full_predictions_returns_all_targets_ranked(self):
+        session = GameSession(
+            source="test",
+            raw_text="",
+            players=["Alice", "Bob", "Charlie", "BotUser"],
+            messages=[Message(player_name="Alice", text="hello", day=1)],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "model.pkl"
+            model_path.write_text("", encoding="utf-8")
+            strategy = BotStrategy(
+                model_path=str(model_path),
+                model_d1_path=str(model_path),
+                min_confidence=0.55,
+            )
+
+            predictions = [
+                SimpleNamespace(player_name="Alice", probabilities={"mafia": 0.10}),
+                SimpleNamespace(player_name="Bob", probabilities={"mafia": 0.75}),
+                SimpleNamespace(player_name="Charlie", probabilities={"mafia": 0.40}),
+            ]
+
+            with patch("mafia_framework.bot.strategy.predict_session", return_value=predictions):
+                results = strategy.get_full_predictions(session, bot_username="BotUser", db_path="dummy.db")
+
+        self.assertEqual([name for name, _ in results], ["Bob", "Charlie", "Alice"])
+        self.assertAlmostEqual(results[0][1], 0.75)
 
     def test_strategy_get_town_read_below_confidence_returns_none(self):
         session = GameSession(
@@ -414,6 +443,33 @@ class TestBotComponents(unittest.TestCase):
         asyncio.run(bot._handle_pm("zorq_bot", "please send me a random name"))
 
         bot.connection.send.assert_not_awaited()
+
+    def test_format_reads_message(self):
+        self.assertEqual(
+            MafiaBot._format_reads_message([("Bob", 0.753), ("Alice", 0.10)]),
+            "Bob 75% | Alice 10%",
+        )
+        self.assertEqual(MafiaBot._format_reads_message([]), "no reads available")
+
+    def test_handle_pm_reads_command_returns_full_ranked_list(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
+        bot.tracker = SimpleNamespace(
+            in_game=True, eliminated=False, players=["Alice", "Bob"], dead_players=set(),
+            get_game_session=Mock(return_value=session),
+        )
+        bot.config = SimpleNamespace(
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+        )
+        bot.strategy = Mock()
+        bot.strategy.get_full_predictions = Mock(return_value=[("Bob", 0.82), ("Alice", 0.20)])
+        bot.connection = Mock()
+        bot.connection.send = AsyncMock()
+
+        asyncio.run(bot._handle_pm("Host", "!reads"))
+
+        bot.connection.send.assert_awaited_once_with("|/pm Host, Bob 82% | Alice 20%")
 
     def test_extract_vote_voter_from_vote_message(self):
         self.assertEqual(MafiaBot._extract_vote_voter("|c:|123|~|Alice has voted BotUser."), "Alice")

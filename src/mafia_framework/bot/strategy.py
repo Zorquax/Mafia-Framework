@@ -118,6 +118,15 @@ class BotStrategy:
             logger.info(f"Top suspect probability ({prob:.4f}) is below min confidence ({self.min_confidence})")
             return None, prob
 
+    def get_full_predictions(self, session: GameSession, bot_username: str, db_path: str) -> list[Tuple[str, float]]:
+        """Returns [(player_name, adjusted_mafia_probability), ...] for every
+        valid target, sorted most-suspicious first. Unlike get_vote_decision,
+        this returns the whole ranked list rather than just the top pick.
+        """
+        scored_players = self._score_players(session, bot_username, db_path)
+        scored_players.sort(key=lambda item: item[1], reverse=True)
+        return scored_players
+
     def get_town_read(self, session: GameSession, bot_username: str, db_path: str) -> Tuple[Optional[str], float]:
         """
         Analyzes the GameSession and returns the player the bot is most

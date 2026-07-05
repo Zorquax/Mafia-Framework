@@ -96,6 +96,19 @@ class MafiaBot:
             db_path=self.config.database.db_path,
         )
 
+    def _get_strategy_full_predictions(self, session) -> list[tuple[str, float]]:
+        return self.strategy.get_full_predictions(
+            session,
+            bot_username=self.config.showdown.username,
+            db_path=self.config.database.db_path,
+        )
+
+    @staticmethod
+    def _format_reads_message(predictions: list[tuple[str, float]]) -> str:
+        if not predictions:
+            return "no reads available"
+        return " | ".join(f"{name} {prob:.0%}" for name, prob in predictions)
+
     def _should_do_random_vote(self, session) -> bool:
         target, _ = self._get_strategy_vote(session)
         return target is None
@@ -720,11 +733,18 @@ class MafiaBot:
         # !vote [player] -> override vote
         # !multiplier [player] [value] -> multiplier
         # !reset -> clear overrides
+        # !reads -> full ranked mafia-probability list for every live player
         parts = msg.strip().split()
         if not parts:
             return
 
         cmd = parts[0].lower()
+        if cmd == "!reads":
+            session = self.tracker.get_game_session()
+            predictions = self._get_strategy_full_predictions(session)
+            await self.connection.send(f"|/pm {clean_sender}, {self._format_reads_message(predictions)}")
+            return
+
         if cmd == "!vote" and len(parts) > 1:
             target = parts[1]
             self.strategy.set_manual_vote(target)
