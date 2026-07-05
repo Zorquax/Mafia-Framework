@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+mafia-env/
+*.egg-info/
+dist/
+build/
+
+*.db
+*.pkl
+.DS_Store
+
+config.toml
