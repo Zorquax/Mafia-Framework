@@ -86,8 +86,7 @@ class TestBotComponents(unittest.TestCase):
         self.assertEqual(tracker.state, "IDLE")
         self.assertEqual(event, "FINISHED")
 
-    def test_strategy_voting_and_overrides(self):
-        # Create a mock session
+    def test_strategy_voting_without_model_returns_none(self):
         session = GameSession(
             source="test",
             raw_text="",
@@ -107,22 +106,13 @@ class TestBotComponents(unittest.TestCase):
             min_confidence=0.55
         )
 
-        # Test manual override voting target selection
-        strategy.set_manual_vote("Bob")
-        target, prob = strategy.get_vote_decision(session, bot_username="BotUser", db_path="dummy.db")
-        self.assertEqual(target, "Bob")
-        self.assertEqual(prob, 1.0)
-
-        # Manual override target not in roster should be ignored
-        strategy.set_manual_vote("UnknownPlayer")
-        # Since the model path doesn't exist, it should return None
+        # Since the model path doesn't exist, no decision can be made.
         target, prob = strategy.get_vote_decision(session, bot_username="BotUser", db_path="dummy.db")
         self.assertIsNone(target)
         self.assertEqual(prob, 0.0)
 
-        # Test resets
+        strategy.set_suspicion_multiplier("Bob", 2.0)
         strategy.reset()
-        self.assertIsNone(strategy.manual_vote_override)
         self.assertEqual(strategy.suspicion_multipliers, {})
 
     def test_strategy_get_town_read_picks_lowest_mafia_probability(self):
@@ -362,18 +352,6 @@ class TestBotComponents(unittest.TestCase):
         self.assertTrue(MafiaBot._is_vote_for_bot("|c:|123|~|Alice voted for bot-user", "BotUser"))
         self.assertFalse(MafiaBot._is_vote_for_bot("|c:|123|~|Alice has voted Bob.", "BotUser"))
 
-    def test_random_vote_is_skipped_when_strategy_has_prediction(self):
-        bot = MafiaBot.__new__(MafiaBot)
-        bot.strategy = Mock()
-        bot.strategy.get_vote_decision.return_value = ("Alice", 0.80)
-        bot.config = SimpleNamespace(
-            showdown=SimpleNamespace(username="BotUser"),
-            database=SimpleNamespace(db_path="dummy.db"),
-        )
-
-        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
-        self.assertFalse(bot._should_do_random_vote(session))
-
     def test_handle_pm_send_responds_with_random_live_player(self):
         bot = MafiaBot.__new__(MafiaBot)
         bot.tracker = SimpleNamespace(in_game=True, eliminated=False, players=["Alice", "Bob"], dead_players=set())
@@ -393,15 +371,15 @@ class TestBotComponents(unittest.TestCase):
         bot = MafiaBot.__new__(MafiaBot)
         for role in ["Werewolf", "Alien", "Cult Leader", "Serial Killer", "Goo"]:
             bot._own_role = role
-            self.assertEqual(bot._get_claim_message(), "VT 1 to hammer", msg=f"role={role}")
+            self.assertEqual(bot._get_claim_message(), "VT", msg=f"role={role}")
 
     def test_get_claim_message_claims_real_role_otherwise(self):
         bot = MafiaBot.__new__(MafiaBot)
         bot._own_role = "Vanilla Townie"
-        self.assertEqual(bot._get_claim_message(), "Vanilla Townie 1 to hammer")
+        self.assertEqual(bot._get_claim_message(), "Vanilla Townie")
 
         bot._own_role = "Mafia Goon"
-        self.assertEqual(bot._get_claim_message(), "Mafia Goon 1 to hammer")
+        self.assertEqual(bot._get_claim_message(), "Mafia Goon")
 
     def test_get_claim_message_none_when_role_unknown(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -410,7 +388,10 @@ class TestBotComponents(unittest.TestCase):
 
     def test_handle_pm_claim_uses_own_role(self):
         bot = MafiaBot.__new__(MafiaBot)
-        bot.tracker = SimpleNamespace(in_game=True, eliminated=False, players=["Alice", "Bob"], dead_players=set())
+        bot.tracker = SimpleNamespace(
+            in_game=True, eliminated=False, players=["Alice", "Bob"], dead_players=set(),
+            hammer_count=None, get_game_session=Mock(return_value=None),
+        )
         bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
         bot.connection = Mock()
         bot.connection.send = AsyncMock()
@@ -418,7 +399,28 @@ class TestBotComponents(unittest.TestCase):
 
         asyncio.run(bot._handle_pm("Alice", ".claim"))
 
-        bot.connection.send.assert_awaited_once_with("|/pm Alice, VT 1 to hammer")
+        bot.connection.send.assert_awaited_once_with("|/pm Alice, VT")
+
+    def test_handle_pm_claim_appends_1_to_hammer_when_actually_at_v1(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(
+            source="test",
+            raw_text="",
+            players=["Alice", "BotUser"],
+            votes=[Vote(voter_name="Alice", target_name="BotUser", day=1, action="vote")],
+        )
+        bot.tracker = SimpleNamespace(
+            in_game=True, eliminated=False, players=["Alice", "BotUser"], dead_players=set(),
+            hammer_count=2, get_game_session=Mock(return_value=session),
+        )
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot.connection = Mock()
+        bot.connection.send = AsyncMock()
+        bot._own_role = "Vanilla Townie"
+
+        asyncio.run(bot._handle_pm("Alice", ".claim"))
+
+        bot.connection.send.assert_awaited_once_with("|/pm Alice, Vanilla Townie 1 to hammer")
 
     def test_handle_pm_learns_own_role_from_role_assignment_pm(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -478,6 +480,44 @@ class TestBotComponents(unittest.TestCase):
         asyncio.run(bot._handle_pm("Host", ".reads"))
 
         bot.connection.send.assert_awaited_once_with("|/pm Host, Bob 82% | Alice 20%")
+
+    def test_handle_pm_vote_command_casts_a_direct_vote(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(in_game=True, eliminated=False, players=["Alice", "Bob"], dead_players=set())
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot.connection = Mock()
+        bot.connection.room = "mafia"
+        bot.connection.send = AsyncMock()
+        bot._current_vote_target = None
+
+        asyncio.run(bot._handle_pm("Host", ".vote Alice"))
+
+        bot.connection.send.assert_any_call("mafia|/mafia vote Alice")
+        bot.connection.send.assert_any_call("|/pm Host, Voted Alice.")
+        self.assertEqual(bot._current_vote_target, "Alice")
+
+    def test_delayed_first_evaluation_waits_configured_seconds(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(state="DAY", eliminated=False)
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(first_evaluation_delay_seconds=60.0))
+        bot._evaluate_and_vote = AsyncMock()
+
+        with patch("mafia_framework.bot.client.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            asyncio.run(bot._delayed_first_evaluation())
+
+        mock_sleep.assert_awaited_once_with(60.0)
+        bot._evaluate_and_vote.assert_awaited_once()
+
+    def test_delayed_first_evaluation_skips_if_day_already_over(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(state="NIGHT", eliminated=False)
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(first_evaluation_delay_seconds=60.0))
+        bot._evaluate_and_vote = AsyncMock()
+
+        with patch("mafia_framework.bot.client.asyncio.sleep", new=AsyncMock()):
+            asyncio.run(bot._delayed_first_evaluation())
+
+        bot._evaluate_and_vote.assert_not_awaited()
 
     def test_question_prompt_ignores_players_after_elimination(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -559,6 +599,72 @@ class TestBotComponents(unittest.TestCase):
         event = tracker.process_message("|c:|127|~|Night 2 has begun.", bot_username="BotUser")
         self.assertEqual(event, "NIGHT")
         self.assertEqual(tracker.state, "NIGHT")
+
+    def test_sub_replaces_player_in_roster_from_combined_message(self):
+        # Real example: both sentences arrive bundled in one message.
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["Blue flare fusion", "Alice", "Bob"]
+        tracker.in_game = True
+
+        event = tracker.process_message(
+            "|c:|1|~|Blue flare fusion has been subbed out. mist has joined the game.",
+            bot_username="BotUser",
+        )
+        self.assertIsNone(event)
+        self.assertEqual(tracker.players, ["mist", "Alice", "Bob"])
+
+    def test_sub_replaces_player_across_separate_messages(self):
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["Charlie", "Dave"]
+        tracker.in_game = True
+
+        tracker.process_message("|c:|1|~|Charlie has been subbed out.", bot_username="BotUser")
+        tracker.process_message("|c:|2|~|Eve has joined the game.", bot_username="BotUser")
+
+        self.assertEqual(tracker.players, ["Eve", "Dave"])
+
+    def test_sub_out_marks_bot_no_longer_in_game(self):
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["BotUser", "Alice"]
+        tracker.in_game = True
+
+        tracker.process_message(
+            "|c:|1|~|BotUser has been subbed out. NewPlayer has joined the game.",
+            bot_username="BotUser",
+        )
+
+        self.assertEqual(tracker.players, ["NewPlayer", "Alice"])
+        self.assertFalse(tracker.in_game)
+
+    def test_sub_in_marks_bot_now_in_game(self):
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["Alice", "Bob"]
+        tracker.in_game = False
+
+        tracker.process_message(
+            "|c:|1|~|Alice has been subbed out. BotUser has joined the game.",
+            bot_username="BotUser",
+        )
+
+        self.assertEqual(tracker.players, ["BotUser", "Bob"])
+        self.assertTrue(tracker.in_game)
+
+    def test_sub_ignores_player_chat_mentioning_subs(self):
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["Alice", "Bob"]
+        tracker.in_game = True
+
+        tracker.process_message(
+            "|c:|1|Alice|lol Bob has been subbed out. troll has joined the game.",
+            bot_username="BotUser",
+        )
+
+        self.assertEqual(tracker.players, ["Alice", "Bob"])
 
     def test_deadline_warnings_trigger_events_once_each(self):
         tracker = GameTracker()

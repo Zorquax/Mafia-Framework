@@ -11,21 +11,15 @@ class BotStrategy:
         self.model_path = model_path
         self.model_d1_path = model_d1_path
         self.min_confidence = min_confidence
-        
-        # Real-time decision override state
-        self.manual_vote_override: Optional[str] = None
-        self.suspicion_multipliers: Dict[str, float] = {}  # player -> multiplier
 
-    def set_manual_vote(self, player_name: Optional[str]):
-        logger.info(f"Setting manual vote override to: {player_name}")
-        self.manual_vote_override = player_name
+        # Real-time decision override state
+        self.suspicion_multipliers: Dict[str, float] = {}  # player -> multiplier
 
     def set_suspicion_multiplier(self, player_name: str, multiplier: float):
         logger.info(f"Setting suspicion multiplier for {player_name} to {multiplier}")
         self.suspicion_multipliers[player_name] = multiplier
 
     def reset(self):
-        self.manual_vote_override = None
         self.suspicion_multipliers = {}
 
     def _score_players(self, session: GameSession, bot_username: str, db_path: str) -> list[Tuple[str, float]]:
@@ -95,15 +89,6 @@ class BotStrategy:
         Analyzes the GameSession and returns (target_player, probability).
         If no player meets the criteria, returns (None, 0.0).
         """
-        # If manual override is set, check if they are in game and alive
-        if self.manual_vote_override:
-            # Clean name for match
-            from ..io.player_names import canonical_player_name
-            target = canonical_player_name(self.manual_vote_override)
-            if any(canonical_player_name(p) == target for p in session.players):
-                logger.info(f"Using manual vote override: {target}")
-                return target, 1.0
-
         scored_players = self._score_players(session, bot_username, db_path)
 
         # Sort by adjusted probability descending

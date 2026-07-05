@@ -4,7 +4,14 @@ from typing import List, Set, Optional
 
 from ..data.flips import extract_flips
 from ..data.models import GameSession
-from ..io.parser import parse_showdown_log, PLAYERS_LIST_RE, DAY_MARKER_RE, ELIMINATION_RE, REVEAL_RE
+from ..io.parser import (
+    parse_showdown_log,
+    split_combined_system_lines,
+    PLAYERS_LIST_RE,
+    DAY_MARKER_RE,
+    ELIMINATION_RE,
+    REVEAL_RE,
+)
 from ..io.player_names import canonical_player_name, player_identity_key
 
 logger = logging.getLogger("mafia_bot.tracker")
@@ -51,6 +58,13 @@ HAMMER_COUNT_RE = re.compile(r"hammer\s+count\s+is\s+set\s+at\s+(?P<hammer>\d+)"
 THREE_MIN_LEFT_RE = re.compile(r"3\s*minutes?\s*left", re.IGNORECASE)
 ONE_MIN_LEFT_RE = re.compile(r"1\s*minute\s*left", re.IGNORECASE)
 
+# Player substitutions, e.g. "Blue flare fusion has been subbed out." /
+# "mist has joined the game." -- these are anchored (^...$) and matched
+# per-line after splitting combined announcements, not searched anywhere in
+# the text, to avoid the same non-greedy over-capture problem eliminations had.
+SUB_OUT_RE = re.compile(r"^(?P<player>.+?)\s+has\s+been\s+subbed\s+out\.?$", re.IGNORECASE)
+SUB_IN_RE = re.compile(r"^(?P<player>.+?)\s+has\s+joined\s+the\s+game\.?$", re.IGNORECASE)
+
 class GameTracker:
     def __init__(self):
         self.state = "IDLE"  # IDLE, SIGNUPS, DAY, NIGHT
@@ -64,6 +78,7 @@ class GameTracker:
         self.bot_username: Optional[str] = None
         self.hammer_count: Optional[int] = None
         self.deadline_warning: Optional[str] = None  # None, "3_minutes", or "1_minute"
+        self._pending_sub_out: Optional[str] = None
 
     @staticmethod
     def _normalize_message_text(line: str) -> str:
@@ -100,6 +115,7 @@ class GameTracker:
         self.dead_players = set()
         self.hammer_count = None
         self.deadline_warning = None
+        self._pending_sub_out = None
 
     def process_message(self, line: str, bot_username: Optional[str] = None) -> Optional[str]:
         """
@@ -191,6 +207,8 @@ class GameTracker:
         if self.state in {"DAY", "NIGHT"}:
             self.accumulated_lines.append(line)
 
+            self._handle_substitutions(clean_text, bot_username)
+
             if ELIMINATION_RE.search(clean_text):
                 self._prune_dead_players(bot_username=bot_username)
 
@@ -271,6 +289,38 @@ class GameTracker:
             if self.eliminated:
                 self.in_game = False
             logger.info(f"Removed dead players from active roster: {sorted(eliminated)}")
+
+    def _handle_substitutions(self, clean_text: str, bot_username: Optional[str] = None) -> None:
+        """Detects "X has been subbed out." / "Y has joined the game." and
+        replaces X with Y in the active roster, preserving their slot. A sub
+        is a replacement, not an elimination -- the incoming player takes
+        over, they don't get marked dead.
+        """
+        effective_bot_username = bot_username or self.bot_username
+        bot_key = player_identity_key(effective_bot_username) if effective_bot_username else None
+
+        for segment in split_combined_system_lines(clean_text).splitlines():
+            segment = segment.strip()
+            if not segment:
+                continue
+
+            sub_out_match = SUB_OUT_RE.match(segment)
+            if sub_out_match:
+                self._pending_sub_out = canonical_player_name(sub_out_match.group("player"))
+                continue
+
+            sub_in_match = SUB_IN_RE.match(segment)
+            if sub_in_match and self._pending_sub_out:
+                new_player = canonical_player_name(sub_in_match.group("player"))
+                old_key = player_identity_key(self._pending_sub_out)
+                new_key = player_identity_key(new_player)
+                self.players = [new_player if player_identity_key(p) == old_key else p for p in self.players]
+                logger.info(f"Player sub: {self._pending_sub_out} -> {new_player}")
+                if bot_key and old_key == bot_key:
+                    self.in_game = False
+                if bot_key and new_key == bot_key:
+                    self.in_game = True
+                self._pending_sub_out = None
 
     def _is_bot_on_roster(self, bot_username: Optional[str]) -> bool:
         if not bot_username:

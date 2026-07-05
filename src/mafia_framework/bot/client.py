@@ -51,7 +51,6 @@ class MafiaBot:
         self._claimed_this_day: bool = False
         self._main_task: Optional[asyncio.Task] = None
         self._random_actions_task: Optional[asyncio.Task] = None
-        self._random_vote_task: Optional[asyncio.Task] = None
         self._ready_for_live_games: bool = False
         self._remembered_lines: list[str] = []
 
@@ -112,10 +111,6 @@ class MafiaBot:
             return "no reads available"
         return " | ".join(f"{name} {prob:.0%}" for name, prob in predictions)
 
-    def _should_do_random_vote(self, session) -> bool:
-        target, _ = self._get_strategy_vote(session)
-        return target is None
-
     def _get_bot_alignment(self, session) -> Optional[str]:
         from ..io.player_names import canonical_player_name
 
@@ -138,17 +133,18 @@ class MafiaBot:
         return random.choice(live_players)
 
     def _get_claim_message(self) -> Optional[str]:
-        """Builds the v-1 claim message from the bot's own (live) role.
+        """Builds the claim text from the bot's own (live) role.
 
         Lies and claims VT for roles that would be too costly to reveal
-        while alive; claims honestly otherwise.
+        while alive; claims honestly otherwise. "1 to hammer" is a separate
+        condition (see _is_at_v1), not part of the claim itself.
         """
         if not self._own_role:
             return None
 
         if LIE_AS_VT_ROLE_RE.search(self._own_role):
-            return "VT 1 to hammer"
-        return f"{self._own_role} 1 to hammer"
+            return "VT"
+        return self._own_role
 
     @staticmethod
     def _compute_live_vote_counts(session) -> dict:
@@ -176,32 +172,39 @@ class MafiaBot:
 
         return counts
 
+    def _get_bot_vote_count(self, session) -> int:
+        from ..io.player_names import canonical_player_name
+
+        counts = self._compute_live_vote_counts(session)
+        bot_clean = canonical_player_name(self.config.showdown.username)
+        return next(
+            (count for target, count in counts.items() if canonical_player_name(target) == bot_clean),
+            0,
+        )
+
+    def _is_at_v1(self, session) -> bool:
+        """True if the bot currently has exactly one vote fewer than hammer."""
+        if self.tracker.hammer_count is None:
+            return False
+        return self._get_bot_vote_count(session) == self.tracker.hammer_count - 1
+
     async def _maybe_claim_at_v1(self):
         """Proactively claims in room chat once the bot is one vote from being hammered."""
         if self._claimed_this_day or self.tracker.hammer_count is None:
             return
 
-        from ..io.player_names import canonical_player_name
-
         session = self.tracker.get_game_session()
-        counts = self._compute_live_vote_counts(session)
-
-        bot_clean = canonical_player_name(self.config.showdown.username)
-        bot_votes = next(
-            (count for target, count in counts.items() if canonical_player_name(target) == bot_clean),
-            0,
-        )
-
-        if bot_votes != self.tracker.hammer_count - 1:
+        if not self._is_at_v1(session):
             return
 
         claim_message = self._get_claim_message()
         if not claim_message:
             return
 
-        logger.info(f"At v-1 (votes={bot_votes}, hammer={self.tracker.hammer_count}); claiming: {claim_message}")
+        full_message = f"{claim_message} 1 to hammer"
+        logger.info(f"At v-1; claiming: {full_message}")
         self._claimed_this_day = True
-        await self._send_chat_message(claim_message)
+        await self._send_chat_message(full_message)
 
     def _choose_night_action_target(self, session) -> Optional[str]:
         from ..io.player_names import canonical_player_name
@@ -267,15 +270,11 @@ class MafiaBot:
                 await self.send_room_command("/mafia role")
             if not self._random_actions_task or self._random_actions_task.done():
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
-            if not self._random_vote_task or self._random_vote_task.done():
-                self._random_vote_task = asyncio.create_task(self._random_vote_loop())
 
     async def stop(self):
         logger.info("Stopping Mafia Bot...")
         if self._random_actions_task:
             self._random_actions_task.cancel()
-        if self._random_vote_task:
-            self._random_vote_task.cancel()
         await self.connection.disconnect()
         if self._main_task:
             await self._main_task
@@ -354,17 +353,13 @@ class MafiaBot:
                 await self.send_room_command("/mafia role")
             if not self._random_actions_task or self._random_actions_task.done():
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
-            if not self._random_vote_task or self._random_vote_task.done():
-                self._random_vote_task = asyncio.create_task(self._random_vote_loop())
 
         elif event == "DAY":
-            logger.info("New day started! Re-evaluating votes...")
+            logger.info("New day started! Will run the first vote evaluation shortly...")
             self._claimed_this_day = False
             if not self._random_actions_task or self._random_actions_task.done():
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
-            if not self._random_vote_task or self._random_vote_task.done():
-                self._random_vote_task = asyncio.create_task(self._random_vote_loop())
-            await self._evaluate_and_vote()
+            asyncio.create_task(self._delayed_first_evaluation())
 
         elif event in ("DEADLINE_3MIN", "DEADLINE_1MIN"):
             # The room only announces these two automatic warnings, so together
@@ -377,8 +372,6 @@ class MafiaBot:
         elif event == "NIGHT":
             if self._random_actions_task:
                 self._random_actions_task.cancel()
-            if self._random_vote_task:
-                self._random_vote_task.cancel()
 
             session = self.tracker.get_game_session()
             if self.tracker.in_game:
@@ -393,8 +386,6 @@ class MafiaBot:
         elif event == "FINISHED":
             if self._random_actions_task:
                 self._random_actions_task.cancel()
-            if self._random_vote_task:
-                self._random_vote_task.cancel()
 
             logger.info("Game finished. Sending gg message.")
             await self.send_room_command("gg")
@@ -526,53 +517,15 @@ class MafiaBot:
             except Exception as e:
                 logger.error(f"Error in random actions loop: {e}")
 
-    async def _random_vote_loop(self):
-        """Casts occasional exploratory votes while unsure, so the bot's
-        voting activity doesn't look robotic (silent until confident, then
-        one decisive vote). Respects the room's vote-lock cooldown before
-        retracting, and backs off entirely once a confident target emerges.
+    async def _delayed_first_evaluation(self):
+        """Waits a bit into the day before the first vote evaluation, since
+        voting the instant the day starts (before anyone's said anything)
+        would just be acting on zero signal.
         """
-        from ..io.player_names import canonical_player_name
-
-        while self.tracker.state == "DAY" and self.tracker.in_game and not self.tracker.eliminated:
-            try:
-                await asyncio.sleep(random.uniform(20.0, 45.0))
-                if self.tracker.state != "DAY" or not self.tracker.in_game or self.tracker.eliminated:
-                    break
-
-                session = self.tracker.get_game_session()
-                if not session.players or not self._should_do_random_vote(session):
-                    continue
-
-                if random.random() > self.config.gameplay.random_vote_chance:
-                    continue
-
-                bot_clean = canonical_player_name(self.config.showdown.username)
-                alive_players = [p for p in session.players if p not in self.tracker.dead_players]
-                valid_targets = [p for p in alive_players if canonical_player_name(p) != bot_clean]
-                if not valid_targets:
-                    continue
-
-                target = random.choice(valid_targets)
-                logger.info(f"Casting random exploratory vote on {target}")
-                await self.send_room_command(f"/mafia vote {target}")
-
-                lock_wait = self.config.gameplay.min_seconds_between_vote_actions + random.uniform(0.0, 6.0)
-                await asyncio.sleep(lock_wait)
-
-                if self.tracker.state != "DAY" or self.tracker.eliminated or self._current_vote_target is not None:
-                    # A confident strategy vote took over in the meantime; don't clobber it.
-                    continue
-
-                fresh_session = self.tracker.get_game_session()
-                if self._should_do_random_vote(fresh_session):
-                    logger.info(f"Retracting random exploratory vote on {target}")
-                    await self.send_room_command("/mafia unvote")
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in random vote loop: {e}")
+        await asyncio.sleep(self.config.gameplay.first_evaluation_delay_seconds)
+        if self.tracker.state == "DAY" and not self.tracker.eliminated:
+            logger.info("Running first vote evaluation of the day.")
+            await self._evaluate_and_vote()
 
     async def _evaluate_and_vote(self):
         if self.tracker.state != "DAY" or self.tracker.eliminated:
@@ -729,11 +682,11 @@ class MafiaBot:
 
         # Command parsing (uses a "." prefix, not "!" -- "!" is reserved for
         # staff broadcast commands on Showdown and gets intercepted):
-        # .vote [player] -> override vote
-        # .multiplier [player] [value] -> multiplier
-        # .reset -> clear overrides
+        # .vote [player] -> cast a vote for player right now (one-time action)
+        # .multiplier [player] [value] -> suspicion multiplier
+        # .reset -> clear suspicion multipliers
         # .reads -> full ranked mafia-probability list for every live player
-        # .claim -> this game's v-1 claim message
+        # .claim -> this game's claim message
         parts = msg.strip().split()
         if not parts:
             return
@@ -743,6 +696,9 @@ class MafiaBot:
             if self.tracker.in_game and not self.tracker.eliminated:
                 claim_message = self._get_claim_message()
                 if claim_message:
+                    session = self.tracker.get_game_session()
+                    if self._is_at_v1(session):
+                        claim_message = f"{claim_message} 1 to hammer"
                     logger.info(f"Responding to claim PM from {clean_sender} with {claim_message}")
                     await self.connection.send(f"|/pm {clean_sender}, {claim_message}")
                 else:
@@ -758,11 +714,9 @@ class MafiaBot:
 
         if cmd == ".vote" and len(parts) > 1:
             target = parts[1]
-            self.strategy.set_manual_vote(target)
-            await self.connection.send(f"|/pm {clean_sender}, Manual vote set to: {target}")
-            # Trigger immediate vote update if in game
-            if self.tracker.state == "DAY":
-                await self._evaluate_and_vote()
+            await self.send_room_command(f"/mafia vote {target}")
+            self._current_vote_target = target
+            await self.connection.send(f"|/pm {clean_sender}, Voted {target}.")
 
         elif cmd == ".multiplier" and len(parts) > 2:
             target = parts[1]

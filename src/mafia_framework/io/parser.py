@@ -38,17 +38,18 @@ REVEAL_RE = re.compile(
     re.IGNORECASE
 )
 
-# Some sources (live protocol messages and some game-log exports) bundle an
-# elimination notice and the immediate role reveal into one sentence, e.g.
-# "X was eliminated! X's role was Y." Without a line break between the two
-# clauses, FLIP_RE/REVEAL_RE's non-greedy player capture backtracks across the
-# whole first clause, producing a mangled player name. Force a line break
-# after the fixed "was eliminated!" phrase before any line-anchored parsing.
-COMBINED_ELIMINATION_RE = re.compile(r"(was eliminated!)\s+(?=\S)", re.IGNORECASE)
+# Some sources (live protocol messages and some game-log exports) bundle
+# multiple system sentences into one message with no line break between them,
+# e.g. "X was eliminated! X's role was Y." or "X has been subbed out. Y has
+# joined the game." Without a line break, non-greedy player captures (FLIP_RE,
+# REVEAL_RE, sub detection) backtrack across the whole first clause, producing
+# a mangled player name. Force a line break after each known fixed phrase
+# before any line-anchored parsing.
+COMBINED_SYSTEM_SENTENCE_RE = re.compile(r"(was eliminated!|has been subbed out\.)\s+(?=\S)", re.IGNORECASE)
 
 
 def split_combined_system_lines(text: str) -> str:
-    return COMBINED_ELIMINATION_RE.sub(r"\1\n", text)
+    return COMBINED_SYSTEM_SENTENCE_RE.sub(r"\1\n", text)
 
 
 def parse_timestamp(timestamp_text: str | None) -> str | None:
