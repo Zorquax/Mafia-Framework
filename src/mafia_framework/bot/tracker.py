@@ -5,7 +5,7 @@ from typing import List, Set, Optional
 from ..data.flips import extract_flips
 from ..data.models import GameSession
 from ..io.parser import parse_showdown_log, PLAYERS_LIST_RE, DAY_MARKER_RE, ELIMINATION_RE, REVEAL_RE
-from ..io.player_names import player_identity_key
+from ..io.player_names import canonical_player_name, player_identity_key
 
 logger = logging.getLogger("mafia_bot.tracker")
 
@@ -42,6 +42,10 @@ NIGHT_START_RE = re.compile(
     re.IGNORECASE
 )
 
+# Regex to extract the current hammer count from a day-marker message
+# (e.g. "Day 5. The hammer count is set at 3")
+HAMMER_COUNT_RE = re.compile(r"hammer\s+count\s+is\s+set\s+at\s+(?P<hammer>\d+)", re.IGNORECASE)
+
 class GameTracker:
     def __init__(self):
         self.state = "IDLE"  # IDLE, SIGNUPS, DAY, NIGHT
@@ -52,6 +56,8 @@ class GameTracker:
         self.in_game = False
         self.eliminated = False
         self.dead_players: Set[str] = set()
+        self.bot_username: Optional[str] = None
+        self.hammer_count: Optional[int] = None
 
     @staticmethod
     def _normalize_message_text(line: str) -> str:
@@ -86,6 +92,7 @@ class GameTracker:
         self.in_game = False
         self.eliminated = False
         self.dead_players = set()
+        self.hammer_count = None
 
     def process_message(self, line: str, bot_username: Optional[str] = None) -> Optional[str]:
         """
@@ -98,6 +105,9 @@ class GameTracker:
             - "FINISHED" if the game ended.
             - None otherwise.
         """
+        if bot_username:
+            self.bot_username = bot_username
+
         # Save raw line in global history
         self.raw_text_history.append(line)
 
@@ -163,6 +173,9 @@ class GameTracker:
                 day_text = day_match.group("day")
                 if day_text:
                     self.current_day = int(day_text)
+                hammer_match = HAMMER_COUNT_RE.search(clean_text)
+                if hammer_match:
+                    self.hammer_count = int(hammer_match.group("hammer"))
                 self._prune_dead_players()
                 logger.info(f"Phase change: Day {self.current_day}")
                 return "DAY"
@@ -184,14 +197,15 @@ class GameTracker:
     def _prune_dead_players(self, bot_username: Optional[str] = None) -> None:
         from ..io.parser import ELIMINATION_RE
 
+        effective_bot_username = bot_username or self.bot_username
         eliminated = set()
         bot_was_eliminated = False
-        bot_key = player_identity_key(bot_username) if bot_username else None
+        bot_key = player_identity_key(effective_bot_username) if effective_bot_username else None
         for line in self.raw_text_history:
             normalized_line = self._normalize_message_text(line)
             match = ELIMINATION_RE.search(normalized_line)
             if match:
-                player = match.group("player").strip()
+                player = canonical_player_name(match.group("player"))
                 if player:
                     eliminated.add(player)
                     if bot_key and player_identity_key(player) == bot_key:
@@ -200,7 +214,10 @@ class GameTracker:
         if eliminated:
             self.dead_players.update(eliminated)
             self.players = [player for player in self.players if player not in self.dead_players]
-            self.eliminated = bot_was_eliminated
+            # Elimination is a one-way latch within a game: once we've seen
+            # ourselves eliminated, never let a later call (e.g. one made
+            # without bot_username) flip it back to False.
+            self.eliminated = self.eliminated or bot_was_eliminated
             if self.eliminated:
                 self.in_game = False
             logger.info(f"Removed dead players from active roster: {sorted(eliminated)}")

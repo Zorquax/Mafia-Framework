@@ -16,6 +16,12 @@ logger = logging.getLogger("mafia_bot.client")
 VOTE_TARGET_RE = re.compile(r"(?P<voter>.+?)\s+(?:has\s+)?voted(?:\s+for)?\s+(?P<target>.+?)(?:\.|$)", re.IGNORECASE)
 VOTE_SOURCE_RE = re.compile(r"(?P<voter>.+?)\s+(?:has\s+)?voted(?:\s+for)?\s+(?P<target>.+?)(?:\.|$)", re.IGNORECASE)
 
+# Matches the role-assignment PM, e.g. "zorq_bot, you are a Vanilla Townie"
+OWN_ROLE_PM_RE = re.compile(r"^(?P<name>.+?),\s*you\s+are\s+an?\s+(?P<role>.+?)\.?\s*$", re.IGNORECASE)
+
+# Roles the bot should claim VT (Vanilla Townie) for instead of its real role.
+LIE_AS_VT_ROLE_RE = re.compile(r"\b(werewolf|alien|cult\w*|serial\s+killer|goo)\b", re.IGNORECASE)
+
 
 class MafiaBot:
     def __init__(self, config_path: str):
@@ -36,6 +42,8 @@ class MafiaBot:
         
         self._current_vote_target: Optional[str] = None
         self._current_town_read: Optional[str] = None
+        self._own_role: Optional[str] = None
+        self._claimed_this_day: bool = False
         self._main_task: Optional[asyncio.Task] = None
         self._periodic_update_task: Optional[asyncio.Task] = None
         self._random_actions_task: Optional[asyncio.Task] = None
@@ -112,26 +120,71 @@ class MafiaBot:
             return None
         return random.choice(live_players)
 
-    def _get_claim_message(self, session) -> Optional[str]:
-        from ..io.player_names import canonical_player_name
+    def _get_claim_message(self) -> Optional[str]:
+        """Builds the v-1 claim message from the bot's own (live) role.
 
-        role_texts = []
-        for event in getattr(session, "events", []):
-            if getattr(event, "event_type", "") == "reveal":
-                role_texts.append(getattr(event, "text", ""))
-
-        if not role_texts:
+        Lies and claims VT for roles that would be too costly to reveal
+        while alive; claims honestly otherwise.
+        """
+        if not self._own_role:
             return None
 
-        bot_clean = canonical_player_name(self.config.showdown.username)
-        for text in role_texts:
-            if bot_clean and bot_clean.lower() in text.lower():
-                role = text.split("role was", 1)[-1].strip()
-                if role.lower().startswith("mafia goon"):
-                    return "VT 1 to hammer"
-                return f"{role} 1 to hammer"
+        if LIE_AS_VT_ROLE_RE.search(self._own_role):
+            return "VT 1 to hammer"
+        return f"{self._own_role} 1 to hammer"
 
-        return None
+    @staticmethod
+    def _compute_live_vote_counts(session) -> dict:
+        """Tallies currently-active votes per target, resetting at each day boundary."""
+        active_votes: dict = {}
+        counts: dict = {}
+        current_day = None
+        for vote in session.votes:
+            if current_day is None:
+                current_day = vote.day
+            if vote.day != current_day:
+                active_votes.clear()
+                counts.clear()
+                current_day = vote.day
+
+            voter = vote.voter_name
+            prev_target = active_votes.pop(voter, None)
+            if prev_target:
+                counts[prev_target] = counts.get(prev_target, 0) - 1
+
+            if vote.action != "unvote":
+                target = vote.target_name
+                active_votes[voter] = target
+                counts[target] = counts.get(target, 0) + 1
+
+        return counts
+
+    async def _maybe_claim_at_v1(self):
+        """Proactively claims in room chat once the bot is one vote from being hammered."""
+        if self._claimed_this_day or self.tracker.hammer_count is None:
+            return
+
+        from ..io.player_names import canonical_player_name
+
+        session = self.tracker.get_game_session()
+        counts = self._compute_live_vote_counts(session)
+
+        bot_clean = canonical_player_name(self.config.showdown.username)
+        bot_votes = next(
+            (count for target, count in counts.items() if canonical_player_name(target) == bot_clean),
+            0,
+        )
+
+        if bot_votes != self.tracker.hammer_count - 1:
+            return
+
+        claim_message = self._get_claim_message()
+        if not claim_message:
+            return
+
+        logger.info(f"At v-1 (votes={bot_votes}, hammer={self.tracker.hammer_count}); claiming: {claim_message}")
+        self._claimed_this_day = True
+        await self._send_chat_message(claim_message)
 
     def _choose_night_action_target(self, session) -> Optional[str]:
         from ..io.player_names import canonical_player_name
@@ -244,6 +297,15 @@ class MafiaBot:
                             logger.info(f"Voting back on {voter} after being voted")
                             await self.send_room_command(f"/mafia vote {voter}")
 
+                    if (
+                        self._ready_for_live_games
+                        and self.tracker.state == "DAY"
+                        and self.tracker.in_game
+                        and not self.tracker.eliminated
+                        and "voted" in line.lower()
+                    ):
+                        await self._maybe_claim_at_v1()
+
                     if event:
                         if self._ready_for_live_games:
                             await self._handle_tracker_event(event)
@@ -270,6 +332,8 @@ class MafiaBot:
             self.strategy.reset()
             self._current_vote_target = None
             self._current_town_read = None
+            self._own_role = None
+            self._claimed_this_day = False
             # Spawn the periodic suspicion update task for the day phase
             if not self._periodic_update_task or self._periodic_update_task.done():
                 self._periodic_update_task = asyncio.create_task(self._periodic_suspicion_updates())
@@ -280,6 +344,7 @@ class MafiaBot:
 
         elif event == "DAY":
             logger.info("New day started! Re-evaluating votes...")
+            self._claimed_this_day = False
             if not self._random_actions_task or self._random_actions_task.done():
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
             if not self._random_vote_task or self._random_vote_task.done():
@@ -325,6 +390,8 @@ class MafiaBot:
             self.strategy.reset()
             self._current_vote_target = None
             self._current_town_read = None
+            self._own_role = None
+            self._claimed_this_day = False
 
     async def _periodic_suspicion_updates(self):
         frequency = self.config.gameplay.update_suspicion_frequency_seconds
@@ -381,13 +448,25 @@ class MafiaBot:
         return template.format(player1=selected_players[0], player2=selected_players[1] if count > 1 else "", player3=selected_players[2] if count > 2 else "").strip()
 
     def _maybe_remember_chat_line(self, line: str) -> None:
+        from ..io.player_names import names_match
+
         parts = line.split("|")
         if len(parts) < 4:
             return
         if parts[1] not in {"c:", "c"}:
             return
 
-        message_text = parts[-1].strip()
+        if parts[1] == "c:":
+            sender = parts[3] if len(parts) > 3 else ""
+            message_text = "|".join(parts[4:]).strip()
+        else:  # "c"
+            sender = parts[2] if len(parts) > 2 else ""
+            message_text = "|".join(parts[3:]).strip()
+
+        # Never learn to repeat our own lines back at the room.
+        if self.config.showdown.username and names_match(sender, self.config.showdown.username):
+            return
+
         if not message_text:
             return
         if message_text.lower().startswith("/mafia"):
@@ -395,9 +474,6 @@ class MafiaBot:
         if message_text.lower().startswith("!" ):
             return
         if len(message_text) > 120:
-            return
-
-        if self.config.showdown.username and self.config.showdown.username.lower() in message_text.lower():
             return
 
         self._remembered_lines.append(message_text)
@@ -577,9 +653,21 @@ class MafiaBot:
 
     async def _handle_pm(self, sender: str, msg: str):
         # Clean prefix decorator if any (e.g. %Host -> Host)
-        from ..io.player_names import canonical_player_name
+        from ..io.player_names import canonical_player_name, names_match
+
+        # Showdown echoes our own outgoing PMs back through the same queue;
+        # never treat our own messages as an incoming request.
+        if self.config.showdown.username and names_match(sender, self.config.showdown.username):
+            return
+
         clean_sender = canonical_player_name(sender)
         logger.info(f"Received PM from {clean_sender}: {msg}")
+
+        own_role_match = OWN_ROLE_PM_RE.match(msg.strip())
+        if own_role_match and self.config.showdown.username and names_match(own_role_match.group("name"), self.config.showdown.username):
+            self._own_role = own_role_match.group("role").strip()
+            logger.info(f"Learned own role from PM: {self._own_role}")
+            return
 
         if self.tracker.in_game and not self.tracker.eliminated and "send" in msg.lower():
             random_player = self._get_random_live_player()
@@ -592,8 +680,7 @@ class MafiaBot:
             return
 
         if self.tracker.in_game and not self.tracker.eliminated and any(token in msg.lower() for token in ["claim", "claiming"]):
-            session = self.tracker.get_game_session()
-            claim_message = self._get_claim_message(session)
+            claim_message = self._get_claim_message()
             if claim_message:
                 logger.info(f"Responding to claim PM from {clean_sender} with {claim_message}")
                 await self.connection.send(f"|/pm {clean_sender}, {claim_message}")

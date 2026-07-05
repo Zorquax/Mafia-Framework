@@ -189,6 +189,58 @@ class TestBotComponents(unittest.TestCase):
         mock_sleep.assert_awaited_once()
         bot.connection.send.assert_awaited_once_with("mafia|hello")
 
+    def test_maybe_remember_chat_line_ignores_own_messages_by_sender(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="zorq_bot"))
+        bot._remembered_lines = []
+
+        # Own message, sent as the bot -- must not be remembered even though
+        # the text itself doesn't mention the bot's name.
+        bot._maybe_remember_chat_line("|c:|123|zorq_bot|I think Bob is scum")
+        self.assertEqual(bot._remembered_lines, [])
+
+        # Someone else's message should still be remembered.
+        bot._maybe_remember_chat_line("|c:|123|Alice|I think Bob is scum")
+        self.assertEqual(bot._remembered_lines, ["I think Bob is scum"])
+
+    def test_maybe_claim_at_v1_triggers_when_bot_reaches_hammer_minus_one(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(
+            source="test",
+            raw_text="",
+            players=["Alice", "BotUser"],
+            votes=[Vote(voter_name="Alice", target_name="BotUser", day=1, action="vote")],
+        )
+        bot.tracker = SimpleNamespace(hammer_count=2, get_game_session=Mock(return_value=session))
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot._claimed_this_day = False
+        bot._own_role = "Vanilla Townie"
+        bot._send_chat_message = AsyncMock()
+
+        asyncio.run(bot._maybe_claim_at_v1())
+
+        bot._send_chat_message.assert_awaited_once_with("Vanilla Townie 1 to hammer")
+        self.assertTrue(bot._claimed_this_day)
+
+    def test_maybe_claim_at_v1_does_nothing_below_hammer_minus_one(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(
+            source="test",
+            raw_text="",
+            players=["Alice", "BotUser"],
+            votes=[Vote(voter_name="Alice", target_name="BotUser", day=1, action="vote")],
+        )
+        bot.tracker = SimpleNamespace(hammer_count=3, get_game_session=Mock(return_value=session))
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot._claimed_this_day = False
+        bot._own_role = "Vanilla Townie"
+        bot._send_chat_message = AsyncMock()
+
+        asyncio.run(bot._maybe_claim_at_v1())
+
+        bot._send_chat_message.assert_not_awaited()
+        self.assertFalse(bot._claimed_this_day)
+
     def test_evaluate_and_vote_announces_new_town_read(self):
         bot = MafiaBot.__new__(MafiaBot)
         session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
@@ -268,26 +320,60 @@ class TestBotComponents(unittest.TestCase):
 
         bot.connection.send.assert_awaited_once_with("|/pm Alice, Bob")
 
-    def test_handle_pm_claim_uses_revealed_role_with_mafia_goon_special_case(self):
+    def test_get_claim_message_lies_as_vt_for_listed_roles(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        for role in ["Werewolf", "Alien", "Cult Leader", "Serial Killer", "Goo"]:
+            bot._own_role = role
+            self.assertEqual(bot._get_claim_message(), "VT 1 to hammer", msg=f"role={role}")
+
+    def test_get_claim_message_claims_real_role_otherwise(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot._own_role = "Vanilla Townie"
+        self.assertEqual(bot._get_claim_message(), "Vanilla Townie 1 to hammer")
+
+        bot._own_role = "Mafia Goon"
+        self.assertEqual(bot._get_claim_message(), "Mafia Goon 1 to hammer")
+
+    def test_get_claim_message_none_when_role_unknown(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot._own_role = None
+        self.assertIsNone(bot._get_claim_message())
+
+    def test_handle_pm_claim_uses_own_role(self):
         bot = MafiaBot.__new__(MafiaBot)
         bot.tracker = SimpleNamespace(in_game=True, eliminated=False, players=["Alice", "Bob"], dead_players=set())
         bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
         bot.connection = Mock()
         bot.connection.send = AsyncMock()
+        bot._own_role = "Cult Leader"
 
-        session = GameSession(
-            source="test",
-            raw_text="",
-            players=["Alice", "Bob", "BotUser"],
-            events=[LogEvent(player_name="BotUser", event_type="reveal", text="BotUser's role was Mafia Goon")],
-        )
-
-        self.assertEqual(bot._get_claim_message(session), "VT 1 to hammer")
-
-        bot.tracker.get_game_session = Mock(return_value=session)
         asyncio.run(bot._handle_pm("Alice", "claim"))
 
         bot.connection.send.assert_awaited_once_with("|/pm Alice, VT 1 to hammer")
+
+    def test_handle_pm_learns_own_role_from_role_assignment_pm(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(in_game=True, eliminated=False, players=["Alice", "Bob"], dead_players=set())
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="zorq_bot"))
+        bot.connection = Mock()
+        bot.connection.send = AsyncMock()
+        bot._own_role = None
+
+        asyncio.run(bot._handle_pm("Host", "zorq_bot, you are a Vanilla Townie"))
+
+        self.assertEqual(bot._own_role, "Vanilla Townie")
+        bot.connection.send.assert_not_awaited()
+
+    def test_handle_pm_ignores_own_echoed_messages(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(in_game=True, eliminated=False, players=["Alice", "Bob"], dead_players=set())
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="zorq_bot"))
+        bot.connection = Mock()
+        bot.connection.send = AsyncMock()
+
+        asyncio.run(bot._handle_pm("zorq_bot", "please send me a random name"))
+
+        bot.connection.send.assert_not_awaited()
 
     def test_extract_vote_voter_from_vote_message(self):
         self.assertEqual(MafiaBot._extract_vote_voter("|c:|123|~|Alice has voted BotUser."), "Alice")
@@ -320,6 +406,33 @@ class TestBotComponents(unittest.TestCase):
 
         self.assertTrue(tracker.eliminated)
         self.assertNotIn("BotUser", tracker.players)
+
+    def test_eliminated_flag_stays_latched_across_later_day_markers(self):
+        # A later _prune_dead_players() call made without bot_username (as
+        # happens on every subsequent day-marker transition) must not flip
+        # the eliminated flag back to False.
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["Alice", "BotUser"]
+        tracker.in_game = True
+
+        tracker.process_message("|c:|1|~|BotUser was eliminated!", bot_username="BotUser")
+        self.assertTrue(tracker.eliminated)
+        self.assertFalse(tracker.in_game)
+
+        tracker.process_message("Day 2. The hammer count is set at 2", bot_username="BotUser")
+        self.assertTrue(tracker.eliminated)
+        self.assertFalse(tracker.in_game)
+        self.assertEqual(tracker.hammer_count, 2)
+
+    def test_hammer_count_parsed_from_day_marker(self):
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["Alice", "Bob"]
+        tracker.in_game = True
+
+        tracker.process_message("Day 3. The hammer count is set at 4", bot_username="BotUser")
+        self.assertEqual(tracker.hammer_count, 4)
 
     def test_tracker_get_game_session_populates_flips_from_reveal_lines(self):
         tracker = GameTracker()
