@@ -121,6 +121,121 @@ class TestBotComponents(unittest.TestCase):
         self.assertIsNone(strategy.manual_vote_override)
         self.assertEqual(strategy.suspicion_multipliers, {})
 
+    def test_strategy_get_town_read_picks_lowest_mafia_probability(self):
+        session = GameSession(
+            source="test",
+            raw_text="",
+            players=["Alice", "Bob", "BotUser"],
+            messages=[Message(player_name="Alice", text="hello", day=1)],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "model.pkl"
+            model_path.write_text("", encoding="utf-8")
+            strategy = BotStrategy(
+                model_path=str(model_path),
+                model_d1_path=str(model_path),
+                min_confidence=0.55,
+            )
+
+            predictions = [
+                SimpleNamespace(player_name="Alice", probabilities={"mafia": 0.05}),
+                SimpleNamespace(player_name="Bob", probabilities={"mafia": 0.80}),
+            ]
+
+            with patch("mafia_framework.bot.strategy.predict_session", return_value=predictions):
+                target, prob = strategy.get_town_read(session, bot_username="BotUser", db_path="dummy.db")
+
+        self.assertEqual(target, "Alice")
+        self.assertAlmostEqual(prob, 0.95)
+
+    def test_strategy_get_town_read_below_confidence_returns_none(self):
+        session = GameSession(
+            source="test",
+            raw_text="",
+            players=["Alice", "Bob", "BotUser"],
+            messages=[Message(player_name="Alice", text="hello", day=1)],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "model.pkl"
+            model_path.write_text("", encoding="utf-8")
+            strategy = BotStrategy(
+                model_path=str(model_path),
+                model_d1_path=str(model_path),
+                min_confidence=0.55,
+            )
+
+            predictions = [
+                SimpleNamespace(player_name="Alice", probabilities={"mafia": 0.50}),
+                SimpleNamespace(player_name="Bob", probabilities={"mafia": 0.60}),
+            ]
+
+            with patch("mafia_framework.bot.strategy.predict_session", return_value=predictions):
+                target, prob = strategy.get_town_read(session, bot_username="BotUser", db_path="dummy.db")
+
+        self.assertIsNone(target)
+        self.assertAlmostEqual(prob, 0.50)
+
+    def test_send_chat_message_delays_before_sending(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.connection = Mock()
+        bot.connection.room = "mafia"
+        bot.connection.send = AsyncMock()
+
+        with patch("mafia_framework.bot.client.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            asyncio.run(bot._send_chat_message("hello"))
+
+        mock_sleep.assert_awaited_once()
+        bot.connection.send.assert_awaited_once_with("mafia|hello")
+
+    def test_evaluate_and_vote_announces_new_town_read(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
+        bot.tracker = SimpleNamespace(
+            state="DAY", eliminated=False, in_game=True,
+            get_game_session=Mock(return_value=session),
+        )
+        bot.strategy = Mock()
+        bot.strategy.get_vote_decision = Mock(return_value=(None, 0.0))
+        bot.strategy.get_town_read = Mock(return_value=("Alice", 0.90))
+        bot.config = SimpleNamespace(
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+        )
+        bot._current_vote_target = None
+        bot._current_town_read = None
+        bot._send_chat_message = AsyncMock()
+        bot.send_room_command = AsyncMock()
+
+        asyncio.run(bot._evaluate_and_vote())
+
+        bot._send_chat_message.assert_awaited_once_with("Alice is town")
+        self.assertEqual(bot._current_town_read, "Alice")
+
+    def test_evaluate_and_vote_does_not_repeat_unchanged_town_read(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
+        bot.tracker = SimpleNamespace(
+            state="DAY", eliminated=False, in_game=True,
+            get_game_session=Mock(return_value=session),
+        )
+        bot.strategy = Mock()
+        bot.strategy.get_vote_decision = Mock(return_value=(None, 0.0))
+        bot.strategy.get_town_read = Mock(return_value=("Alice", 0.90))
+        bot.config = SimpleNamespace(
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+        )
+        bot._current_vote_target = None
+        bot._current_town_read = "Alice"
+        bot._send_chat_message = AsyncMock()
+        bot.send_room_command = AsyncMock()
+
+        asyncio.run(bot._evaluate_and_vote())
+
+        bot._send_chat_message.assert_not_awaited()
+
     def test_vote_detection_for_bot_username(self):
         self.assertTrue(MafiaBot._is_vote_for_bot("|c:|123|~|Alice has voted BotUser.", "BotUser"))
         self.assertTrue(MafiaBot._is_vote_for_bot("|c:|123|~|Alice voted for bot-user", "BotUser"))

@@ -28,20 +28,8 @@ class BotStrategy:
         self.manual_vote_override = None
         self.suspicion_multipliers = {}
 
-    def get_vote_decision(self, session: GameSession, bot_username: str, db_path: str) -> Tuple[Optional[str], float]:
-        """
-        Analyzes the GameSession and returns (target_player, probability).
-        If no player meets the criteria, returns (None, 0.0).
-        """
-        # If manual override is set, check if they are in game and alive
-        if self.manual_vote_override:
-            # Clean name for match
-            from ..io.player_names import canonical_player_name
-            target = canonical_player_name(self.manual_vote_override)
-            if any(canonical_player_name(p) == target for p in session.players):
-                logger.info(f"Using manual vote override: {target}")
-                return target, 1.0
-
+    def _score_players(self, session: GameSession, bot_username: str, db_path: str) -> list[Tuple[str, float]]:
+        """Returns [(player_name, adjusted_mafia_probability), ...] for all valid targets."""
         # Determine if we should use Day 1 model
         # Use day_one model if current day is 1 and day_one model file exists
         from pathlib import Path
@@ -50,7 +38,7 @@ class BotStrategy:
 
         if not Path(model_to_use).exists():
             logger.warning(f"Model file {model_to_use} not found! Cannot make automated vote decision.")
-            return None, 0.0
+            return []
 
         logger.info(f"Running predictions using model: {model_to_use} (day_one={day_one})")
         try:
@@ -62,7 +50,7 @@ class BotStrategy:
             )
         except Exception as e:
             logger.error(f"Error during predict_session: {e}")
-            return None, 0.0
+            return []
 
         # Get sets of already flipped or dead players using normalized identity keys.
         flipped_player_keys = {player_identity_key(flip.player_name) for flip in session.flips}
@@ -87,7 +75,7 @@ class BotStrategy:
                 continue
 
             prob_mafia = pred.probabilities.get("mafia", 0.0)
-            
+
             # Apply real-time suspicion multiplier if set
             multiplier = self.suspicion_multipliers.get(pred.player_name, 1.0)
             adjusted_prob = prob_mafia * multiplier
@@ -95,6 +83,24 @@ class BotStrategy:
             adjusted_prob = min(adjusted_prob, 1.0)
 
             scored_players.append((pred.player_name, adjusted_prob))
+
+        return scored_players
+
+    def get_vote_decision(self, session: GameSession, bot_username: str, db_path: str) -> Tuple[Optional[str], float]:
+        """
+        Analyzes the GameSession and returns (target_player, probability).
+        If no player meets the criteria, returns (None, 0.0).
+        """
+        # If manual override is set, check if they are in game and alive
+        if self.manual_vote_override:
+            # Clean name for match
+            from ..io.player_names import canonical_player_name
+            target = canonical_player_name(self.manual_vote_override)
+            if any(canonical_player_name(p) == target for p in session.players):
+                logger.info(f"Using manual vote override: {target}")
+                return target, 1.0
+
+        scored_players = self._score_players(session, bot_username, db_path)
 
         # Sort by adjusted probability descending
         scored_players.sort(key=lambda item: item[1], reverse=True)
@@ -111,3 +117,28 @@ class BotStrategy:
         else:
             logger.info(f"Top suspect probability ({prob:.4f}) is below min confidence ({self.min_confidence})")
             return None, prob
+
+    def get_town_read(self, session: GameSession, bot_username: str, db_path: str) -> Tuple[Optional[str], float]:
+        """
+        Analyzes the GameSession and returns the player the bot is most
+        confident is town, as (target_player, town_probability).
+        If no player meets the confidence bar, returns (None, town_probability_of_best_candidate).
+        """
+        scored_players = self._score_players(session, bot_username, db_path)
+
+        # Sort by adjusted mafia probability ascending (i.e. most town-confident first)
+        scored_players.sort(key=lambda item: item[1])
+
+        if not scored_players:
+            logger.info("No valid town-read targets found.")
+            return None, 0.0
+
+        target, prob_mafia = scored_players[0]
+        prob_town = 1.0 - prob_mafia
+        logger.info(f"Strongest town read: {target} with probability: {prob_town:.4f}")
+
+        if prob_town >= self.min_confidence:
+            return target, prob_town
+        else:
+            logger.info(f"Best town read probability ({prob_town:.4f}) is below min confidence ({self.min_confidence})")
+            return None, prob_town

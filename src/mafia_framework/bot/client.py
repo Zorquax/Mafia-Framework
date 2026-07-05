@@ -35,9 +35,11 @@ class MafiaBot:
         )
         
         self._current_vote_target: Optional[str] = None
+        self._current_town_read: Optional[str] = None
         self._main_task: Optional[asyncio.Task] = None
         self._periodic_update_task: Optional[asyncio.Task] = None
         self._random_actions_task: Optional[asyncio.Task] = None
+        self._random_vote_task: Optional[asyncio.Task] = None
         self._ready_for_live_games: bool = False
         self._remembered_lines: list[str] = []
 
@@ -73,6 +75,13 @@ class MafiaBot:
 
     def _get_strategy_vote(self, session) -> tuple[Optional[str], float]:
         return self.strategy.get_vote_decision(
+            session,
+            bot_username=self.config.showdown.username,
+            db_path=self.config.database.db_path,
+        )
+
+    def _get_strategy_town_read(self, session) -> tuple[Optional[str], float]:
+        return self.strategy.get_town_read(
             session,
             bot_username=self.config.showdown.username,
             db_path=self.config.database.db_path,
@@ -144,6 +153,17 @@ class MafiaBot:
         print(f"\n>>> EXECUTING COMMAND: {msg}\n")
         await self.connection.send(msg)
 
+    async def _send_chat_message(self, text: str):
+        """Send a spoken chat line with a human-like typing delay beforehand.
+
+        Unlike /mafia slash commands (which are instant UI actions), a chat
+        line should feel like someone actually typed it before it posts.
+        """
+        typing_seconds = len(text) * random.uniform(0.04, 0.09)
+        delay = min(random.uniform(0.6, 1.8) + typing_seconds, 10.0)
+        await asyncio.sleep(delay)
+        await self.send_room_command(text)
+
     async def start(self):
         logger.info("Starting Mafia Bot orchestrator...")
         # Ensure database and models directories exist
@@ -177,6 +197,8 @@ class MafiaBot:
                 self._periodic_update_task = asyncio.create_task(self._periodic_suspicion_updates())
             if not self._random_actions_task or self._random_actions_task.done():
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
+            if not self._random_vote_task or self._random_vote_task.done():
+                self._random_vote_task = asyncio.create_task(self._random_vote_loop())
 
     async def stop(self):
         logger.info("Stopping Mafia Bot...")
@@ -184,6 +206,8 @@ class MafiaBot:
             self._periodic_update_task.cancel()
         if self._random_actions_task:
             self._random_actions_task.cancel()
+        if self._random_vote_task:
+            self._random_vote_task.cancel()
         await self.connection.disconnect()
         if self._main_task:
             await self._main_task
@@ -213,12 +237,12 @@ class MafiaBot:
                         delay = random.uniform(2.0, 5.0)
                         logger.info(f"Delayed vote reaction by {delay:.2f}s")
                         await asyncio.sleep(delay)
+                        catchphrases = ["why me", "im town", "get off", "bruh", "they're gonna qh"]
+                        await self._send_chat_message(random.choice(catchphrases))
                         voter = self._extract_vote_voter(line)
                         if voter:
                             logger.info(f"Voting back on {voter} after being voted")
                             await self.send_room_command(f"/mafia vote {voter}")
-                        catchphrases = ["why me", "im town", "get off", "bruh", "they're gonna qh"]
-                        await self.send_room_command(random.choice(catchphrases))
 
                     if event:
                         if self._ready_for_live_games:
@@ -245,24 +269,31 @@ class MafiaBot:
         elif event == "STARTED":
             self.strategy.reset()
             self._current_vote_target = None
+            self._current_town_read = None
             # Spawn the periodic suspicion update task for the day phase
             if not self._periodic_update_task or self._periodic_update_task.done():
                 self._periodic_update_task = asyncio.create_task(self._periodic_suspicion_updates())
             if not self._random_actions_task or self._random_actions_task.done():
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
-                
+            if not self._random_vote_task or self._random_vote_task.done():
+                self._random_vote_task = asyncio.create_task(self._random_vote_loop())
+
         elif event == "DAY":
             logger.info("New day started! Re-evaluating votes...")
             if not self._random_actions_task or self._random_actions_task.done():
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
+            if not self._random_vote_task or self._random_vote_task.done():
+                self._random_vote_task = asyncio.create_task(self._random_vote_loop())
             await self._evaluate_and_vote()
-            
+
         elif event == "NIGHT":
             # Cancel periodic updates during night
             if self._periodic_update_task:
                 self._periodic_update_task.cancel()
             if self._random_actions_task:
                 self._random_actions_task.cancel()
+            if self._random_vote_task:
+                self._random_vote_task.cancel()
 
             session = self.tracker.get_game_session()
             if self.tracker.in_game:
@@ -280,6 +311,8 @@ class MafiaBot:
                 self._periodic_update_task.cancel()
             if self._random_actions_task:
                 self._random_actions_task.cancel()
+            if self._random_vote_task:
+                self._random_vote_task.cancel()
 
             logger.info("Game finished. Sending gg message.")
             await self.send_room_command("gg")
@@ -291,6 +324,7 @@ class MafiaBot:
             self.tracker.reset()
             self.strategy.reset()
             self._current_vote_target = None
+            self._current_town_read = None
 
     async def _periodic_suspicion_updates(self):
         frequency = self.config.gameplay.update_suspicion_frequency_seconds
@@ -371,8 +405,12 @@ class MafiaBot:
             self._remembered_lines = self._remembered_lines[-12:]
 
     async def _random_actions_loop(self):
+        """Periodically says filler chat, so the bot doesn't sit silent all day.
+
+        Each message goes through _send_chat_message so it's paced like
+        someone actually typing it, rather than several lines firing at once.
+        """
         filler_words = ["bruh", "hm", "oh", "welp", "bleh", "uhh", "thinking", "...", "interesting", "lol", "i mean"]
-        from ..io.player_names import canonical_player_name
 
         while self.tracker.state == "DAY" and self.tracker.in_game and not self.tracker.eliminated:
             try:
@@ -380,52 +418,81 @@ class MafiaBot:
                 if self.tracker.state != "DAY" or not self.tracker.in_game or self.tracker.eliminated:
                     break
 
-                if not self.tracker.in_game:
-                    logger.info("No longer participating in the game; stopping random actions loop.")
-                    break
-
                 word = random.choice(filler_words)
                 logger.info(f"Saying random filler word: {word}")
-                await self.send_room_command(word)
+                await self._send_chat_message(word)
 
-                if self._remembered_lines:
+                if not self.tracker.in_game:
+                    logger.info("Bot is no longer in the game; stopping random actions loop.")
+                    break
+
+                if self._remembered_lines and random.random() < 0.5:
                     remembered_line = random.choice(self._remembered_lines)
                     logger.info(f"Repeating remembered line: {remembered_line}")
-                    await self.send_room_command(remembered_line)
+                    await self._send_chat_message(remembered_line)
 
-                session = self.tracker.get_game_session()
-                if not self.tracker.in_game:
-                    logger.info("Bot is no longer in the game; stopping random actions loop.")
+                if self.tracker.state != "DAY" or not self.tracker.in_game or self.tracker.eliminated:
                     break
 
-                question_prompt = self._build_question_prompt(session)
-                if question_prompt:
-                    logger.info(f"Asking random question: {question_prompt}")
-                    await self.send_room_command(question_prompt)
-                if not self.tracker.in_game:
-                    logger.info("Bot is no longer in the game; stopping random actions loop.")
-                    break
-
-                if session.players and self._should_do_random_vote(session):
-                    alive_players = [p for p in session.players if p not in self.tracker.dead_players]
-                    bot_clean = canonical_player_name(self.config.showdown.username)
-                    valid_targets = [p for p in alive_players if canonical_player_name(p) != bot_clean]
-
-                    if valid_targets:
-                        target = random.choice(valid_targets)
-                        logger.info(f"Doing random vote on {target}")
-                        await self.send_room_command(f"/mafia vote {target}")
-
-                        await asyncio.sleep(random.uniform(2.0, 5.0))
-
-                        if self.tracker.state == "DAY":
-                            logger.info(f"Unvoting random target {target}")
-                            await self.send_room_command("/mafia unvote")
+                if random.random() < 0.5:
+                    session = self.tracker.get_game_session()
+                    question_prompt = self._build_question_prompt(session)
+                    if question_prompt:
+                        logger.info(f"Asking random question: {question_prompt}")
+                        await self._send_chat_message(question_prompt)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in random actions loop: {e}")
+
+    async def _random_vote_loop(self):
+        """Casts occasional exploratory votes while unsure, so the bot's
+        voting activity doesn't look robotic (silent until confident, then
+        one decisive vote). Respects the room's vote-lock cooldown before
+        retracting, and backs off entirely once a confident target emerges.
+        """
+        from ..io.player_names import canonical_player_name
+
+        while self.tracker.state == "DAY" and self.tracker.in_game and not self.tracker.eliminated:
+            try:
+                await asyncio.sleep(random.uniform(20.0, 45.0))
+                if self.tracker.state != "DAY" or not self.tracker.in_game or self.tracker.eliminated:
+                    break
+
+                session = self.tracker.get_game_session()
+                if not session.players or not self._should_do_random_vote(session):
+                    continue
+
+                if random.random() > self.config.gameplay.random_vote_chance:
+                    continue
+
+                bot_clean = canonical_player_name(self.config.showdown.username)
+                alive_players = [p for p in session.players if p not in self.tracker.dead_players]
+                valid_targets = [p for p in alive_players if canonical_player_name(p) != bot_clean]
+                if not valid_targets:
+                    continue
+
+                target = random.choice(valid_targets)
+                logger.info(f"Casting random exploratory vote on {target}")
+                await self.send_room_command(f"/mafia vote {target}")
+
+                lock_wait = self.config.gameplay.min_seconds_between_vote_actions + random.uniform(0.0, 6.0)
+                await asyncio.sleep(lock_wait)
+
+                if self.tracker.state != "DAY" or self.tracker.eliminated or self._current_vote_target is not None:
+                    # A confident strategy vote took over in the meantime; don't clobber it.
+                    continue
+
+                fresh_session = self.tracker.get_game_session()
+                if self._should_do_random_vote(fresh_session):
+                    logger.info(f"Retracting random exploratory vote on {target}")
+                    await self.send_room_command("/mafia unvote")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in random vote loop: {e}")
 
     async def _evaluate_and_vote(self):
         if self.tracker.state != "DAY" or self.tracker.eliminated:
@@ -446,7 +513,8 @@ class MafiaBot:
         if target:
             if target != self._current_vote_target:
                 logger.info(f"Decided to vote for {target} (confidence: {confidence:.2%}). Previous: {self._current_vote_target}")
-                await self.send_room_command(f"I think {target} is scum")
+                await self._send_chat_message(f"I think {target} is scum")
+                await asyncio.sleep(random.uniform(1.0, 3.0))
                 await self.send_room_command(f"/mafia vote {target}")
                 self._current_vote_target = target
             else:
@@ -456,6 +524,17 @@ class MafiaBot:
                 logger.info("No clear target meets confidence threshold. Unvoting.")
                 await self.send_room_command("/mafia unvote")
                 self._current_vote_target = None
+
+        town_read, town_confidence = self._get_strategy_town_read(session)
+        if town_read:
+            if town_read != self._current_town_read:
+                logger.info(f"Decided {town_read} is town (confidence: {town_confidence:.2%}). Previous: {self._current_town_read}")
+                await self._send_chat_message(f"{town_read} is town")
+                self._current_town_read = town_read
+            else:
+                logger.info(f"Maintaining current town read on {town_read} (confidence: {town_confidence:.2%})")
+        else:
+            self._current_town_read = None
 
     async def _save_game_to_db(self):
         session = self.tracker.get_game_session()
