@@ -115,6 +115,25 @@ class TestBotComponents(unittest.TestCase):
         strategy.reset()
         self.assertEqual(strategy.suspicion_multipliers, {})
 
+    def test_get_vote_decision_min_confidence_override(self):
+        strategy = BotStrategy(model_path="nonexistent_model.pkl", model_d1_path="nonexistent_model_d1.pkl", min_confidence=0.55)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob", "BotUser"])
+
+        with patch.object(strategy, "_score_players", return_value=[("Bob", 0.65)]):
+            # Default threshold (0.55): confident enough to vote.
+            target, prob = strategy.get_vote_decision(session, bot_username="BotUser", db_path="dummy.db")
+            self.assertEqual(target, "Bob")
+            self.assertAlmostEqual(prob, 0.65)
+
+            # A stricter override (e.g. during VoLo) should withhold the
+            # vote even though the same underlying score would normally
+            # clear the bar.
+            target, prob = strategy.get_vote_decision(
+                session, bot_username="BotUser", db_path="dummy.db", min_confidence=0.75
+            )
+            self.assertIsNone(target)
+            self.assertAlmostEqual(prob, 0.65)
+
     def test_strategy_get_town_read_picks_lowest_mafia_probability(self):
         session = GameSession(
             source="test",
@@ -226,6 +245,14 @@ class TestBotComponents(unittest.TestCase):
         bot._maybe_remember_chat_line("|c:|123|Alice|I think Bob is scum")
         self.assertEqual(bot._remembered_lines, ["I think Bob is scum"])
 
+    def test_maybe_remember_chat_line_ignores_system_announcements(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="zorq_bot"))
+        bot._remembered_lines = []
+
+        bot._maybe_remember_chat_line("|c:|123|~|**Players (3)**: Alice, Bob, zorq_bot")
+        self.assertEqual(bot._remembered_lines, [])
+
     def test_maybe_claim_at_v1_triggers_when_bot_reaches_hammer_minus_one(self):
         bot = MafiaBot.__new__(MafiaBot)
         session = GameSession(
@@ -264,6 +291,27 @@ class TestBotComponents(unittest.TestCase):
         bot._send_chat_message.assert_not_awaited()
         self.assertFalse(bot._claimed_this_day)
 
+    def test_maybe_claim_at_v1_prefers_live_vote_counts_over_chat_derived(self):
+        # The chat-derived reconstruction (no votes recorded at all) would
+        # say the bot has 0 votes, but the authoritative `/mafia votes` reply
+        # says it's already sitting at hammer-minus-one -- that should win.
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "BotUser"], votes=[])
+        bot.tracker = SimpleNamespace(
+            hammer_count=2,
+            live_vote_counts={"BotUser": 1},
+            get_game_session=Mock(return_value=session),
+        )
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot._claimed_this_day = False
+        bot._own_role = "Vanilla Townie"
+        bot._send_chat_message = AsyncMock()
+
+        asyncio.run(bot._maybe_claim_at_v1())
+
+        bot._send_chat_message.assert_awaited_once_with("Vanilla Townie 1 to hammer")
+        self.assertTrue(bot._claimed_this_day)
+
     def test_evaluate_and_vote_announces_new_town_read(self):
         bot = MafiaBot.__new__(MafiaBot)
         session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
@@ -288,6 +336,149 @@ class TestBotComponents(unittest.TestCase):
 
         bot._send_chat_message.assert_awaited_once_with("Alice is town")
         self.assertEqual(bot._current_town_read, "Alice")
+
+    def test_evaluate_and_vote_raises_confidence_bar_during_volo(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
+        bot.tracker = SimpleNamespace(
+            state="DAY", eliminated=False, in_game=True,
+            get_game_session=Mock(return_value=session),
+        )
+        bot.strategy = Mock()
+        bot.strategy.get_vote_decision = Mock(return_value=(None, 0.0))
+        bot.strategy.get_town_read = Mock(return_value=(None, 0.0))
+        bot.config = SimpleNamespace(
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0, volo_min_confidence=0.75),
+        )
+        bot._current_vote_target = None
+        bot._current_town_read = None
+        bot._send_chat_message = AsyncMock()
+        bot.send_room_command = AsyncMock()
+        bot._is_volo = Mock(return_value=True)
+
+        asyncio.run(bot._evaluate_and_vote())
+
+        bot.strategy.get_vote_decision.assert_called_once()
+        _, kwargs = bot.strategy.get_vote_decision.call_args
+        self.assertEqual(kwargs.get("min_confidence"), 0.75)
+
+    def test_evaluate_and_vote_uses_default_confidence_when_not_volo(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
+        bot.tracker = SimpleNamespace(
+            state="DAY", eliminated=False, in_game=True,
+            get_game_session=Mock(return_value=session),
+        )
+        bot.strategy = Mock()
+        bot.strategy.get_vote_decision = Mock(return_value=(None, 0.0))
+        bot.strategy.get_town_read = Mock(return_value=(None, 0.0))
+        bot.config = SimpleNamespace(
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0, volo_min_confidence=0.75),
+        )
+        bot._current_vote_target = None
+        bot._current_town_read = None
+        bot._send_chat_message = AsyncMock()
+        bot.send_room_command = AsyncMock()
+        bot._is_volo = Mock(return_value=False)
+
+        asyncio.run(bot._evaluate_and_vote())
+
+        _, kwargs = bot.strategy.get_vote_decision.call_args
+        self.assertIsNone(kwargs.get("min_confidence"))
+
+    def test_evaluate_and_vote_random_fallback_when_no_confident_target(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob", "BotUser"])
+        bot.tracker = SimpleNamespace(
+            state="DAY", eliminated=False, in_game=True, dead_players=set(),
+            get_game_session=Mock(return_value=session),
+        )
+        bot.strategy = Mock()
+        bot.strategy.min_confidence = 0.55
+        bot.strategy.get_vote_decision = Mock(return_value=(None, 0.0))
+        bot.strategy.get_town_read = Mock(return_value=(None, 0.0))
+        bot.strategy.get_full_predictions = Mock(return_value=[("Alice", 0.3), ("Bob", 0.3)])
+        bot.config = SimpleNamespace(
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0),
+        )
+        bot._current_vote_target = None
+        bot._current_town_read = None
+        bot._send_chat_message = AsyncMock()
+        bot.send_room_command = AsyncMock()
+
+        with patch("random.choice", return_value="Alice"):
+            asyncio.run(bot._evaluate_and_vote(allow_random_fallback=True))
+
+        bot.send_room_command.assert_any_call("/mafia vote Alice")
+        self.assertEqual(bot._current_vote_target, "Alice")
+        bot._send_chat_message.assert_not_awaited()
+
+    def test_evaluate_and_vote_no_random_fallback_by_default(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob", "BotUser"])
+        bot.tracker = SimpleNamespace(
+            state="DAY", eliminated=False, in_game=True, dead_players=set(),
+            get_game_session=Mock(return_value=session),
+        )
+        bot.strategy = Mock()
+        bot.strategy.get_vote_decision = Mock(return_value=(None, 0.0))
+        bot.strategy.get_town_read = Mock(return_value=(None, 0.0))
+        bot.config = SimpleNamespace(
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0),
+        )
+        bot._current_vote_target = None
+        bot._current_town_read = None
+        bot._send_chat_message = AsyncMock()
+        bot.send_room_command = AsyncMock()
+
+        asyncio.run(bot._evaluate_and_vote())
+
+        bot.send_room_command.assert_not_awaited()
+        self.assertIsNone(bot._current_vote_target)
+
+    def test_pick_random_vote_target_excludes_confident_town_reads(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob", "BotUser"])
+        bot.tracker = SimpleNamespace(dead_players=set())
+        bot.config = SimpleNamespace(
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+        )
+        bot.strategy = Mock()
+        bot.strategy.min_confidence = 0.55
+        # Alice reads confidently town (95% town / 5% mafia); Bob is a toss-up.
+        bot.strategy.get_full_predictions = Mock(return_value=[("Alice", 0.05), ("Bob", 0.5)])
+
+        with patch("random.choice", side_effect=lambda pool: pool[0]):
+            target = bot._pick_random_vote_target(session)
+
+        self.assertEqual(target, "Bob")
+
+    def test_pick_random_vote_target_falls_back_to_full_pool_if_everyone_reads_town(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob", "BotUser"])
+        bot.tracker = SimpleNamespace(dead_players=set())
+        bot.config = SimpleNamespace(
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+        )
+        bot.strategy = Mock()
+        bot.strategy.min_confidence = 0.55
+        # Both read as confidently town -- degenerate short-game case.
+        bot.strategy.get_full_predictions = Mock(return_value=[("Alice", 0.05), ("Bob", 0.02)])
+
+        with patch("random.choice", side_effect=lambda pool: pool[0]):
+            target = bot._pick_random_vote_target(session)
+
+        self.assertIn(target, ["Alice", "Bob"])
 
     def test_evaluate_and_vote_does_not_repeat_unchanged_town_read(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -347,10 +538,146 @@ class TestBotComponents(unittest.TestCase):
             asyncio.run(bot._handle_tracker_event(event))
             bot._evaluate_and_vote.assert_awaited_once()
 
+    def test_started_event_requests_role_and_original_rolelist(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(in_game=True)
+        bot.strategy = Mock()
+        bot.strategy.reset = Mock()
+        bot._random_actions_task = None
+        bot.send_room_command = AsyncMock()
+
+        asyncio.run(bot._handle_tracker_event("STARTED"))
+
+        bot.send_room_command.assert_any_call("/mafia role")
+        bot.send_room_command.assert_any_call("/mafia originalrolelist")
+
+    def test_votes_update_event_triggers_claim_check(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(state="DAY", in_game=True, eliminated=False)
+        bot._maybe_claim_at_v1 = AsyncMock()
+
+        asyncio.run(bot._handle_tracker_event("VOTES_UPDATE"))
+
+        bot._maybe_claim_at_v1.assert_awaited_once()
+
+    def test_votes_update_event_skipped_when_not_in_active_day(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(state="NIGHT", in_game=True, eliminated=False)
+        bot._maybe_claim_at_v1 = AsyncMock()
+
+        asyncio.run(bot._handle_tracker_event("VOTES_UPDATE"))
+
+        bot._maybe_claim_at_v1.assert_not_awaited()
+
+    def test_is_plurality_target_true_when_bot_has_the_most_votes(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(live_vote_counts={"BotUser": 3, "Alice": 2})
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+
+        self.assertTrue(bot._is_plurality_target())
+
+    def test_is_plurality_target_false_when_someone_else_leads(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(live_vote_counts={"BotUser": 1, "Alice": 3})
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+
+        self.assertFalse(bot._is_plurality_target())
+
+    def test_is_plurality_target_false_with_no_live_counts_yet(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(live_vote_counts={})
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+
+        self.assertFalse(bot._is_plurality_target())
+
+    def test_maybe_claim_if_plurality_near_deadline_claims_when_leading(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(live_vote_counts={"BotUser": 2, "Alice": 1})
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot._claimed_this_day = False
+        bot._own_role = "Vanilla Townie"
+        bot._send_chat_message = AsyncMock()
+
+        asyncio.run(bot._maybe_claim_if_plurality_near_deadline())
+
+        bot._send_chat_message.assert_awaited_once_with("Vanilla Townie")
+        self.assertTrue(bot._claimed_this_day)
+
+    def test_maybe_claim_if_plurality_near_deadline_skips_when_already_claimed(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(live_vote_counts={"BotUser": 2, "Alice": 1})
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot._claimed_this_day = True
+        bot._own_role = "Vanilla Townie"
+        bot._send_chat_message = AsyncMock()
+
+        asyncio.run(bot._maybe_claim_if_plurality_near_deadline())
+
+        bot._send_chat_message.assert_not_awaited()
+
+    def test_deadline_1min_schedules_plurality_claim_check(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot._random_actions_task = None
+        bot._evaluate_and_vote = AsyncMock()
+        bot._delayed_plurality_claim_check = AsyncMock()
+
+        with patch("mafia_framework.bot.client.asyncio.create_task") as mock_create_task:
+            asyncio.run(bot._handle_tracker_event("DEADLINE_1MIN"))
+            mock_create_task.assert_called_once()
+
+    def test_deadline_3min_does_not_schedule_plurality_claim_check(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot._random_actions_task = None
+        bot._evaluate_and_vote = AsyncMock()
+
+        with patch("mafia_framework.bot.client.asyncio.create_task") as mock_create_task:
+            asyncio.run(bot._handle_tracker_event("DEADLINE_3MIN"))
+            mock_create_task.assert_not_called()
+
+    def test_count_mafia_roles_counts_tokens_containing_mafia(self):
+        self.assertEqual(MafiaBot._count_mafia_roles(["mafia", "ic", "vt"]), 1)
+        self.assertEqual(MafiaBot._count_mafia_roles(["mafia roleblocker", "mafia goon", "vt", "cop"]), 2)
+        self.assertEqual(MafiaBot._count_mafia_roles(["vt", "cop", "doctor"]), 0)
+
+    def test_is_volo_false_without_rolelist_data(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(original_role_tokens=[], dead_players=set())
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
+
+        self.assertFalse(bot._is_volo(session))
+
+    def test_is_volo_true_when_mafia_near_parity(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        # 1 mafia, 3 roles total; one town death already confirmed (not
+        # mafia), so of the 2 alive, 1 is mafia -- that's parity.
+        bot.tracker = SimpleNamespace(
+            original_role_tokens=["mafia", "vt", "ic"],
+            dead_players={"Ic"},
+        )
+        session = GameSession(
+            source="test",
+            raw_text="",
+            players=["Alice", "Bob"],
+            flips=[Flip(player_name="Ic", alignment="town")],
+        )
+
+        self.assertTrue(bot._is_volo(session))
+
+    def test_is_volo_false_when_mafia_far_from_parity(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(original_role_tokens=["mafia", "vt", "vt", "vt", "vt"], dead_players=set())
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob", "Carl", "Dave", "Eve"])
+
+        self.assertFalse(bot._is_volo(session))
+
     def test_vote_detection_for_bot_username(self):
         self.assertTrue(MafiaBot._is_vote_for_bot("|c:|123|~|Alice has voted BotUser.", "BotUser"))
         self.assertTrue(MafiaBot._is_vote_for_bot("|c:|123|~|Alice voted for bot-user", "BotUser"))
         self.assertFalse(MafiaBot._is_vote_for_bot("|c:|123|~|Alice has voted Bob.", "BotUser"))
+
+    def test_extract_vote_voter_name(self):
+        self.assertEqual(MafiaBot._extract_vote_voter_name("|c:|123|~|Alice has voted BotUser."), "Alice")
+        self.assertIsNone(MafiaBot._extract_vote_voter_name("|c:|123|~|Alice is just chatting"))
 
     def test_handle_pm_send_responds_with_random_live_player(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -496,6 +823,22 @@ class TestBotComponents(unittest.TestCase):
         bot.connection.send.assert_any_call("|/pm Host, Voted Alice.")
         self.assertEqual(bot._current_vote_target, "Alice")
 
+    def test_handle_pm_vote_rejects_nonexistent_player(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(in_game=True, eliminated=False, players=["Alice", "Bob"], dead_players=set())
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot.connection = Mock()
+        bot.connection.room = "mafia"
+        bot.connection.send = AsyncMock()
+        bot._current_vote_target = None
+
+        # Typo: "pomegrenato" vs the real player "Pomegranato".
+        bot.tracker.players = ["Pomegranato", "lordsnackquaza"]
+        asyncio.run(bot._handle_pm("Host", ".vote pomegrenato"))
+
+        bot.connection.send.assert_awaited_once_with("|/pm Host, pomegrenato is not a real player.")
+        self.assertIsNone(bot._current_vote_target)
+
     def test_delayed_first_evaluation_waits_configured_seconds(self):
         bot = MafiaBot.__new__(MafiaBot)
         bot.tracker = SimpleNamespace(state="DAY", eliminated=False)
@@ -573,6 +916,82 @@ class TestBotComponents(unittest.TestCase):
 
         tracker.process_message("Day 3. The hammer count is set at 4", bot_username="BotUser")
         self.assertEqual(tracker.hammer_count, 4)
+
+    def test_parses_mafia_votes_response(self):
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["A Flowers Dream", "Brady1014", "mist"]
+        tracker.in_game = True
+
+        line = (
+            '|c:|123|~|/raw <div class="infobox">Votes (Hammer: 2)<br />'
+            "2* A Flowers Dream (Brady1014, mist)<br />"
+            "1 Brady1014 (A Flowers Dream)</div>"
+        )
+        event = tracker.process_message(line, bot_username="mist")
+
+        self.assertEqual(event, "VOTES_UPDATE")
+        self.assertEqual(tracker.hammer_count, 2)
+        self.assertEqual(
+            tracker.live_vote_counts,
+            {"A Flowers Dream": 2, "Brady1014": 1},
+        )
+
+    def test_votes_response_from_player_chat_is_ignored(self):
+        # Only a genuine system ("~") message can update the live tally --
+        # a player pasting the same text shouldn't be trusted.
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["Alice", "Bob"]
+        tracker.in_game = True
+
+        line = '|c:|123|Alice|Votes (Hammer: 2)<br />2* Bob (Alice)'
+        event = tracker.process_message(line, bot_username="BotUser")
+
+        self.assertIsNone(event)
+        self.assertIsNone(tracker.hammer_count)
+        self.assertEqual(tracker.live_vote_counts, {})
+
+    def test_parses_mafia_votes_response_excludes_no_vote_bucket(self):
+        # The real reply also lists a "No Vote" row for idling players --
+        # seen live as e.g. "2 No Vote (Alice, Bob)" -- which isn't a real
+        # target and shouldn't be treated as one.
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["Carl", "Alice", "Bob"]
+        tracker.in_game = True
+
+        line = (
+            '|c:|123|~|/raw <div class="infobox">Votes (Hammer: 2)<br />'
+            "1 Carl (Carl)<br />"
+            "2 No Vote (Alice, Bob)</div>"
+        )
+        tracker.process_message(line, bot_username="Carl")
+
+        self.assertEqual(tracker.live_vote_counts, {"Carl": 1})
+
+    def test_parses_original_rolelist_response(self):
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.in_game = True
+
+        event = tracker.process_message(
+            "|c:|123|~|Original Rolelist: mafia, ic, vt", bot_username="BotUser"
+        )
+
+        self.assertIsNone(event)
+        self.assertEqual(tracker.original_role_tokens, ["mafia", "ic", "vt"])
+
+    def test_original_rolelist_from_player_chat_is_ignored(self):
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.in_game = True
+
+        tracker.process_message(
+            "|c:|123|Alice|Original Rolelist: mafia, ic, vt", bot_username="BotUser"
+        )
+
+        self.assertEqual(tracker.original_role_tokens, [])
 
     def test_player_chat_cannot_fake_phase_transitions(self):
         # Several phase-detection regexes have no anchor requiring them to

@@ -36,7 +36,10 @@ class GameplayConfig:
     night_idle: bool = True
     vote_comment_chance: float = 0.5
     town_read_comment_chance: float = 0.5
+    vote_reaction_chance: float = 0.5
     first_evaluation_delay_seconds: float = 60.0
+    claim_lead_seconds: float = 30.0
+    volo_min_confidence: float = 0.75
 
 
 @dataclass
@@ -84,7 +87,10 @@ class BotConfig:
                 night_idle=gameplay_data.get("night_idle", True),
                 vote_comment_chance=float(gameplay_data.get("vote_comment_chance", 0.5)),
                 town_read_comment_chance=float(gameplay_data.get("town_read_comment_chance", 0.5)),
+                vote_reaction_chance=float(gameplay_data.get("vote_reaction_chance", 0.5)),
                 first_evaluation_delay_seconds=float(gameplay_data.get("first_evaluation_delay_seconds", 60.0)),
+                claim_lead_seconds=float(gameplay_data.get("claim_lead_seconds", 30.0)),
+                volo_min_confidence=float(gameplay_data.get("volo_min_confidence", 0.75)),
             ),
             database=DatabaseConfig(
                 db_path=str(resolve_repo_path(database_data.get("db_path", "data/mafia.db"))),

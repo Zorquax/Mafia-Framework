@@ -53,6 +53,20 @@ NIGHT_START_RE = re.compile(
 # (e.g. "Day 5. The hammer count is set at 3")
 HAMMER_COUNT_RE = re.compile(r"hammer\s+count\s+is\s+set\s+at\s+(?P<hammer>\d+)", re.IGNORECASE)
 
+# The `/mafia votes` reply is a single raw-HTML blob shaped like:
+#   Votes (Hammer: 2)
+#   2* A Flowers Dream (Brady1014, mist)
+#   1 Brady1014 (A Flowers Dream)
+# ("*" just flags the current plurality leader -- not parsed, not needed).
+VOTES_HEADER_RE = re.compile(r"votes\s*\(hammer:\s*(?P<hammer>\d+)\)", re.IGNORECASE)
+VOTES_LINE_RE = re.compile(r"^(?P<count>\d+)\*?\s+(?P<target>.+?)\s+\((?P<voters>.+?)\)\s*$", re.IGNORECASE)
+
+# The `/mafia originalrolelist` reply, e.g. "Original Rolelist: mafia, ic, vt"
+# -- a flat, comma-separated list of role tokens for the whole game as it
+# started (not who has which role, just the overall composition), used to
+# work out the mafia-vs-total split for VoLo/parity tracking.
+ORIGINAL_ROLELIST_RE = re.compile(r"original\s+rolelist:\s*(?P<roles>.+)", re.IGNORECASE)
+
 # The room automatically posts these as the day's deadline approaches, e.g.
 # "**3 minutes left!**" / "**1 minute left!**"
 THREE_MIN_LEFT_RE = re.compile(r"3\s*minutes?\s*left", re.IGNORECASE)
@@ -77,6 +91,8 @@ class GameTracker:
         self.dead_players: Set[str] = set()
         self.bot_username: Optional[str] = None
         self.hammer_count: Optional[int] = None
+        self.live_vote_counts: dict = {}
+        self.original_role_tokens: List[str] = []
         self.deadline_warning: Optional[str] = None  # None, "3_minutes", or "1_minute"
         self._pending_sub_out: Optional[str] = None
 
@@ -114,6 +130,8 @@ class GameTracker:
         self.eliminated = False
         self.dead_players = set()
         self.hammer_count = None
+        self.live_vote_counts = {}
+        self.original_role_tokens = []
         self.deadline_warning = None
         self._pending_sub_out = None
 
@@ -126,6 +144,7 @@ class GameTracker:
             - "DAY" if day phase started.
             - "NIGHT" if night phase started.
             - "FINISHED" if the game ended.
+            - "VOTES_UPDATE" if a `/mafia votes` reply was parsed.
             - None otherwise.
         """
         if bot_username:
@@ -156,6 +175,12 @@ class GameTracker:
             # phase/state transitions.
             if self.state in {"DAY", "NIGHT"}:
                 self.accumulated_lines.append(line)
+            return None
+
+        if self._parse_votes_response(line):
+            return "VOTES_UPDATE"
+
+        if self._parse_original_rolelist(line):
             return None
 
         # If we are in IDLE or SIGNUPS, check for signup start
@@ -261,6 +286,74 @@ class GameTracker:
                 return "FINISHED"
 
         return None
+
+    def _parse_votes_response(self, line: str) -> bool:
+        """Parses the room's `/mafia votes` reply into live_vote_counts +
+        hammer_count. The reply arrives as one raw-HTML blob with <br>-style
+        line breaks rather than one message per row, so those have to be
+        restored to real newlines before the per-row regex can run.
+        """
+        parts = line.split("|")
+        if len(parts) > 3 and parts[1] == "c:":
+            payload = "|".join(parts[4:])
+        elif len(parts) > 2 and parts[1] == "c":
+            payload = "|".join(parts[3:])
+        elif len(parts) > 2 and parts[1] == "raw":
+            payload = "|".join(parts[2:])
+        else:
+            payload = line
+
+        payload = re.sub(r"<br\s*/?>", "\n", payload, flags=re.IGNORECASE)
+        payload = re.sub(r"<[^>]*>", "", payload)
+
+        header_match = VOTES_HEADER_RE.search(payload)
+        if not header_match:
+            return False
+
+        self.hammer_count = int(header_match.group("hammer"))
+        counts: dict = {}
+        for text_line in payload.splitlines():
+            row_match = VOTES_LINE_RE.match(text_line.strip())
+            if not row_match:
+                continue
+            target = canonical_player_name(row_match.group("target").strip())
+            # The reply also lists a "No Vote" bucket for idling players --
+            # that's not a real target, and including it would make the
+            # non-voting count masquerade as the plurality leader.
+            if target and player_identity_key(target) != "novote":
+                counts[target] = int(row_match.group("count"))
+
+        self.live_vote_counts = counts
+        logger.info(f"Parsed /mafia votes response: hammer={self.hammer_count}, counts={self.live_vote_counts}")
+        return True
+
+    def _parse_original_rolelist(self, line: str) -> bool:
+        """Parses the room's `/mafia originalrolelist` reply into a flat
+        list of role tokens (e.g. "mafia, ic, vt" -> ["mafia", "ic", "vt"]),
+        so the mafia-vs-total split can be computed later without needing to
+        know which living player holds which role.
+        """
+        parts = line.split("|")
+        if len(parts) > 3 and parts[1] == "c:":
+            payload = "|".join(parts[4:])
+        elif len(parts) > 2 and parts[1] == "c":
+            payload = "|".join(parts[3:])
+        elif len(parts) > 2 and parts[1] == "raw":
+            payload = "|".join(parts[2:])
+        else:
+            payload = line
+
+        payload = re.sub(r"<br\s*/?>", "\n", payload, flags=re.IGNORECASE)
+        payload = re.sub(r"<[^>]*>", "", payload)
+
+        match = ORIGINAL_ROLELIST_RE.search(payload)
+        if not match:
+            return False
+
+        tokens = [token.strip().lower() for token in match.group("roles").split(",") if token.strip()]
+        self.original_role_tokens = tokens
+        logger.info(f"Parsed original rolelist: {tokens}")
+        return True
 
     def _prune_dead_players(self, bot_username: Optional[str] = None) -> None:
         from ..io.parser import ELIMINATION_RE
