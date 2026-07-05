@@ -20,7 +20,11 @@ class TestBotComponents(unittest.TestCase):
         config = BotConfig.load_from_file("nonexistent_config.toml")
         self.assertEqual(config.showdown.room, "mafia")
         self.assertEqual(config.gameplay.autojoin, True)
-        self.assertEqual(config.database.db_path, "data/mafia.db")
+        # db_path is resolved to an absolute path (robust to whatever
+        # directory the process was launched from), so just check the
+        # meaningful suffix rather than the raw config default.
+        self.assertTrue(config.database.db_path.replace("\\", "/").endswith("data/mafia.db"))
+        self.assertTrue(Path(config.database.db_path).is_absolute())
 
     def test_config_loading_custom(self):
         toml_content = """
@@ -48,7 +52,8 @@ class TestBotComponents(unittest.TestCase):
             self.assertEqual(config.gameplay.autojoin, False)
             self.assertEqual(config.gameplay.min_confidence_to_vote, 0.65)
             self.assertEqual(config.gameplay.night_idle, False)
-            self.assertEqual(config.database.db_path, "test_data/test.db")
+            self.assertTrue(config.database.db_path.replace("\\", "/").endswith("test_data/test.db"))
+            self.assertTrue(Path(config.database.db_path).is_absolute())
 
     def test_game_tracker_transitions(self):
         tracker = GameTracker()

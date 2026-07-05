@@ -7,6 +7,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from ..paths import resolve_repo_path
+
 # Python 3.11+ has tomllib, fall back to toml package for older versions if needed
 if sys.version_info >= (3, 11):
     import tomllib
@@ -53,15 +55,7 @@ class BotConfig:
 
     @classmethod
     def load_from_file(cls, path: str | Path) -> BotConfig:
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            cwd_candidate = Path.cwd() / candidate
-            if cwd_candidate.exists():
-                candidate = cwd_candidate
-            else:
-                repo_candidate = Path(__file__).resolve().parents[2] / candidate
-                if repo_candidate.exists():
-                    candidate = repo_candidate
+        candidate = resolve_repo_path(path)
 
         data = {}
         if candidate.exists():
@@ -95,8 +89,8 @@ class BotConfig:
                 town_read_comment_chance=float(gameplay_data.get("town_read_comment_chance", 0.5)),
             ),
             database=DatabaseConfig(
-                db_path=database_data.get("db_path", "data/mafia.db"),
-                model_path=database_data.get("model_path", "data/model.pkl"),
-                model_d1_path=database_data.get("model_d1_path", "data/model_d1.pkl"),
+                db_path=str(resolve_repo_path(database_data.get("db_path", "data/mafia.db"))),
+                model_path=str(resolve_repo_path(database_data.get("model_path", "data/model.pkl"))),
+                model_d1_path=str(resolve_repo_path(database_data.get("model_d1_path", "data/model_d1.pkl"))),
             ),
         )
