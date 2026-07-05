@@ -22,6 +22,8 @@ OWN_ROLE_PM_RE = re.compile(r"^(?P<name>.+?),\s*you\s+are\s+an?\s+(?P<role>.+?)\
 # Roles the bot should claim VT (Vanilla Townie) for instead of its real role.
 LIE_AS_VT_ROLE_RE = re.compile(r"\b(werewolf|alien|cult\w*|serial\s+killer|goo)\b", re.IGNORECASE)
 
+VALID_ALIGNMENTS = {"town", "mafia", "neutral", "unknown"}
+
 
 class MafiaBot:
     def __init__(self, config_path: str):
@@ -45,7 +47,6 @@ class MafiaBot:
         self._own_role: Optional[str] = None
         self._claimed_this_day: bool = False
         self._main_task: Optional[asyncio.Task] = None
-        self._periodic_update_task: Optional[asyncio.Task] = None
         self._random_actions_task: Optional[asyncio.Task] = None
         self._random_vote_task: Optional[asyncio.Task] = None
         self._ready_for_live_games: bool = False
@@ -246,8 +247,6 @@ class MafiaBot:
                 await self.send_room_command("/mafia join")
         elif self.tracker.state == "DAY":
             logger.info("Backlog indicates game is in progress (DAY phase).")
-            if not self._periodic_update_task or self._periodic_update_task.done():
-                self._periodic_update_task = asyncio.create_task(self._periodic_suspicion_updates())
             if not self._random_actions_task or self._random_actions_task.done():
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
             if not self._random_vote_task or self._random_vote_task.done():
@@ -255,8 +254,6 @@ class MafiaBot:
 
     async def stop(self):
         logger.info("Stopping Mafia Bot...")
-        if self._periodic_update_task:
-            self._periodic_update_task.cancel()
         if self._random_actions_task:
             self._random_actions_task.cancel()
         if self._random_vote_task:
@@ -334,9 +331,6 @@ class MafiaBot:
             self._current_town_read = None
             self._own_role = None
             self._claimed_this_day = False
-            # Spawn the periodic suspicion update task for the day phase
-            if not self._periodic_update_task or self._periodic_update_task.done():
-                self._periodic_update_task = asyncio.create_task(self._periodic_suspicion_updates())
             if not self._random_actions_task or self._random_actions_task.done():
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
             if not self._random_vote_task or self._random_vote_task.done():
@@ -351,10 +345,15 @@ class MafiaBot:
                 self._random_vote_task = asyncio.create_task(self._random_vote_loop())
             await self._evaluate_and_vote()
 
+        elif event in ("DEADLINE_3MIN", "DEADLINE_1MIN"):
+            # The room only announces these two automatic warnings, so together
+            # with the day-start evaluation above they give exactly the "3
+            # times a day" re-evaluation cadence, tied to real game milestones
+            # instead of a fixed timer.
+            logger.info(f"Deadline warning ({event}); re-evaluating votes...")
+            await self._evaluate_and_vote()
+
         elif event == "NIGHT":
-            # Cancel periodic updates during night
-            if self._periodic_update_task:
-                self._periodic_update_task.cancel()
             if self._random_actions_task:
                 self._random_actions_task.cancel()
             if self._random_vote_task:
@@ -371,9 +370,6 @@ class MafiaBot:
                     await self.send_room_command("/mafia idle")
                 
         elif event == "FINISHED":
-            # Cancel periodic updates
-            if self._periodic_update_task:
-                self._periodic_update_task.cancel()
             if self._random_actions_task:
                 self._random_actions_task.cancel()
             if self._random_vote_task:
@@ -392,19 +388,6 @@ class MafiaBot:
             self._current_town_read = None
             self._own_role = None
             self._claimed_this_day = False
-
-    async def _periodic_suspicion_updates(self):
-        frequency = self.config.gameplay.update_suspicion_frequency_seconds
-        while self.tracker.state == "DAY" and self.tracker.in_game and not self.tracker.eliminated:
-            try:
-                await asyncio.sleep(frequency)
-                if self.tracker.state == "DAY" and not self.tracker.eliminated:
-                    logger.info("Running periodic day suspicion re-evaluation...")
-                    await self._evaluate_and_vote()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in periodic suspicion updates: {e}")
 
     def _build_question_prompt(self, session) -> Optional[str]:
         from ..io.player_names import canonical_player_name
@@ -589,9 +572,7 @@ class MafiaBot:
         if target:
             if target != self._current_vote_target:
                 logger.info(f"Decided to vote for {target} (confidence: {confidence:.2%}). Previous: {self._current_vote_target}")
-                await self._send_chat_message(f"I think {target} is scum")
-                await asyncio.sleep(random.uniform(1.0, 3.0))
-                await self.send_room_command(f"/mafia vote {target}")
+                await self._cast_vote_with_optional_comment(target)
                 self._current_vote_target = target
             else:
                 logger.info(f"Maintaining current vote on {target} (confidence: {confidence:.2%})")
@@ -605,12 +586,31 @@ class MafiaBot:
         if town_read:
             if town_read != self._current_town_read:
                 logger.info(f"Decided {town_read} is town (confidence: {town_confidence:.2%}). Previous: {self._current_town_read}")
-                await self._send_chat_message(f"{town_read} is town")
+                if random.random() < self.config.gameplay.town_read_comment_chance:
+                    await self._send_chat_message(f"{town_read} is town")
                 self._current_town_read = town_read
             else:
                 logger.info(f"Maintaining current town read on {town_read} (confidence: {town_confidence:.2%})")
         else:
             self._current_town_read = None
+
+    async def _cast_vote_with_optional_comment(self, target: str):
+        """Casts a vote the way a person actually would: not always narrated,
+        and when it is, not always glued to the vote in the same order.
+        """
+        if random.random() >= self.config.gameplay.vote_comment_chance:
+            await self.send_room_command(f"/mafia vote {target}")
+            return
+
+        comment = f"I think {target} is scum"
+        if random.random() < 0.5:
+            await self._send_chat_message(comment)
+            await asyncio.sleep(random.uniform(1.0, 3.0))
+            await self.send_room_command(f"/mafia vote {target}")
+        else:
+            await self.send_room_command(f"/mafia vote {target}")
+            await asyncio.sleep(random.uniform(2.0, 6.0))
+            await self._send_chat_message(comment)
 
     async def _save_game_to_db(self):
         session = self.tracker.get_game_session()
@@ -648,8 +648,35 @@ class MafiaBot:
             )
             logger.info(f"Successfully saved game to DB with id={game_id}")
             print(f">>> SAVED AS GAME ID {game_id}")
+            await self._prompt_for_undefined_roles(self.config.database.db_path, game_id)
         except Exception as e:
             logger.error(f"Failed to persist game to database: {e}")
+
+    async def _prompt_for_undefined_roles(self, db_path: str, game_id: int) -> None:
+        """Lets the host fill in roles for players who never flipped (e.g.
+        survivors), right at the terminal, instead of needing the dashboard.
+        """
+        from ..services.game_service import assign_player_role, find_undefined_players
+
+        loop = asyncio.get_running_loop()
+        undefined = await loop.run_in_executor(None, find_undefined_players, db_path, game_id)
+        if not undefined:
+            return
+
+        print(f"\n{len(undefined)} player(s) have no recorded role (likely survived to the end):")
+        for row in undefined:
+            hint = "has chat" if row.has_messages else "silent"
+            if row.is_inferred_town_candidate:
+                hint += ", inferred town"
+            prompt = f"  Role for {row.player_name} ({hint}) [town/mafia/neutral/unknown, blank=skip]: "
+            answer = (await loop.run_in_executor(None, input, prompt)).strip().lower()
+            if not answer:
+                continue
+            if answer not in VALID_ALIGNMENTS:
+                print(f"  Skipping {row.player_name}: {answer!r} is not a valid role.")
+                continue
+            assign_player_role(db_path, game_id, row.player_name, answer)
+            print(f"  Set {row.player_name} to {answer}.")
 
     async def _handle_pm(self, sender: str, msg: str):
         # Clean prefix decorator if any (e.g. %Host -> Host)

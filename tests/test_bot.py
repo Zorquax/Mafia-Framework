@@ -10,6 +10,7 @@ from mafia_framework.bot.config import BotConfig
 from mafia_framework.bot.tracker import GameTracker
 from mafia_framework.bot.strategy import BotStrategy
 from mafia_framework.data.models import GameSession, Message, Vote, Flip, LogEvent
+from mafia_framework.services.game_service import UndefinedPlayerRow
 
 
 class TestBotComponents(unittest.TestCase):
@@ -19,7 +20,11 @@ class TestBotComponents(unittest.TestCase):
         config = BotConfig.load_from_file("nonexistent_config.toml")
         self.assertEqual(config.showdown.room, "mafia")
         self.assertEqual(config.gameplay.autojoin, True)
-        self.assertEqual(config.database.db_path, "data/mafia.db")
+        # db_path is resolved to an absolute path (robust to whatever
+        # directory the process was launched from), so just check the
+        # meaningful suffix rather than the raw config default.
+        self.assertTrue(config.database.db_path.replace("\\", "/").endswith("data/mafia.db"))
+        self.assertTrue(Path(config.database.db_path).is_absolute())
 
     def test_config_loading_custom(self):
         toml_content = """
@@ -32,7 +37,6 @@ class TestBotComponents(unittest.TestCase):
         autojoin = false
         min_confidence_to_vote = 0.65
         night_idle = false
-        update_suspicion_frequency_seconds = 30
 
         [database]
         db_path = "test_data/test.db"
@@ -48,8 +52,8 @@ class TestBotComponents(unittest.TestCase):
             self.assertEqual(config.gameplay.autojoin, False)
             self.assertEqual(config.gameplay.min_confidence_to_vote, 0.65)
             self.assertEqual(config.gameplay.night_idle, False)
-            self.assertEqual(config.gameplay.update_suspicion_frequency_seconds, 30)
-            self.assertEqual(config.database.db_path, "test_data/test.db")
+            self.assertTrue(config.database.db_path.replace("\\", "/").endswith("test_data/test.db"))
+            self.assertTrue(Path(config.database.db_path).is_absolute())
 
     def test_game_tracker_transitions(self):
         tracker = GameTracker()
@@ -254,6 +258,7 @@ class TestBotComponents(unittest.TestCase):
         bot.config = SimpleNamespace(
             showdown=SimpleNamespace(username="BotUser"),
             database=SimpleNamespace(db_path="dummy.db"),
+            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0),
         )
         bot._current_vote_target = None
         bot._current_town_read = None
@@ -278,6 +283,7 @@ class TestBotComponents(unittest.TestCase):
         bot.config = SimpleNamespace(
             showdown=SimpleNamespace(username="BotUser"),
             database=SimpleNamespace(db_path="dummy.db"),
+            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0),
         )
         bot._current_vote_target = None
         bot._current_town_read = "Alice"
@@ -287,6 +293,40 @@ class TestBotComponents(unittest.TestCase):
         asyncio.run(bot._evaluate_and_vote())
 
         bot._send_chat_message.assert_not_awaited()
+
+    def test_cast_vote_with_optional_comment_silent_when_chance_is_zero(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(vote_comment_chance=0.0))
+        bot._send_chat_message = AsyncMock()
+        bot.send_room_command = AsyncMock()
+
+        asyncio.run(bot._cast_vote_with_optional_comment("Alice"))
+
+        bot._send_chat_message.assert_not_awaited()
+        bot.send_room_command.assert_awaited_once_with("/mafia vote Alice")
+
+    def test_cast_vote_with_optional_comment_speaks_when_chance_is_one(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(vote_comment_chance=1.0))
+        bot._send_chat_message = AsyncMock()
+        bot.send_room_command = AsyncMock()
+
+        with patch("mafia_framework.bot.client.asyncio.sleep", new=AsyncMock()):
+            asyncio.run(bot._cast_vote_with_optional_comment("Alice"))
+
+        bot._send_chat_message.assert_awaited_once_with("I think Alice is scum")
+        bot.send_room_command.assert_awaited_once_with("/mafia vote Alice")
+
+    def test_deadline_events_trigger_reevaluation(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot._random_actions_task = None
+        bot._random_vote_task = None
+        bot._evaluate_and_vote = AsyncMock()
+
+        for event in ("DEADLINE_3MIN", "DEADLINE_1MIN"):
+            bot._evaluate_and_vote.reset_mock()
+            asyncio.run(bot._handle_tracker_event(event))
+            bot._evaluate_and_vote.assert_awaited_once()
 
     def test_vote_detection_for_bot_username(self):
         self.assertTrue(MafiaBot._is_vote_for_bot("|c:|123|~|Alice has voted BotUser.", "BotUser"))
@@ -434,6 +474,36 @@ class TestBotComponents(unittest.TestCase):
         tracker.process_message("Day 3. The hammer count is set at 4", bot_username="BotUser")
         self.assertEqual(tracker.hammer_count, 4)
 
+    def test_deadline_warnings_trigger_events_once_each(self):
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["Alice", "Bob"]
+        tracker.in_game = True
+
+        event = tracker.process_message("**3 minutes left!**", bot_username="BotUser")
+        self.assertEqual(event, "DEADLINE_3MIN")
+        self.assertEqual(tracker.deadline_warning, "3_minutes")
+
+        # Repeating the same warning must not re-trigger the event.
+        event = tracker.process_message("**3 minutes left!**", bot_username="BotUser")
+        self.assertIsNone(event)
+
+        event = tracker.process_message("**1 minute left!**", bot_username="BotUser")
+        self.assertEqual(event, "DEADLINE_1MIN")
+        self.assertEqual(tracker.deadline_warning, "1_minute")
+
+    def test_deadline_warning_resets_on_new_day(self):
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["Alice", "Bob"]
+        tracker.in_game = True
+
+        tracker.process_message("**1 minute left!**", bot_username="BotUser")
+        self.assertEqual(tracker.deadline_warning, "1_minute")
+
+        tracker.process_message("Day 2. The hammer count is set at 3", bot_username="BotUser")
+        self.assertIsNone(tracker.deadline_warning)
+
     def test_tracker_get_game_session_populates_flips_from_reveal_lines(self):
         tracker = GameTracker()
         tracker.accumulated_lines = [
@@ -526,3 +596,48 @@ class TestBotComponents(unittest.TestCase):
 
         self.assertEqual(target, "Alice")
         self.assertAlmostEqual(prob, 0.80)
+
+    def test_prompt_for_undefined_roles_assigns_valid_input(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        rows = [
+            UndefinedPlayerRow(game_id=1, display_name=None, player_name="Alice", has_messages=True, is_inferred_town_candidate=True),
+            UndefinedPlayerRow(game_id=1, display_name=None, player_name="Bob", has_messages=False, is_inferred_town_candidate=False),
+        ]
+
+        with (
+            patch("mafia_framework.services.game_service.find_undefined_players", return_value=rows),
+            patch("mafia_framework.services.game_service.assign_player_role") as mock_assign,
+            patch("builtins.input", side_effect=["town", "mafia"]),
+        ):
+            asyncio.run(bot._prompt_for_undefined_roles("dummy.db", 1))
+
+        mock_assign.assert_any_call("dummy.db", 1, "Alice", "town")
+        mock_assign.assert_any_call("dummy.db", 1, "Bob", "mafia")
+        self.assertEqual(mock_assign.call_count, 2)
+
+    def test_prompt_for_undefined_roles_skips_blank_and_invalid_input(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        rows = [
+            UndefinedPlayerRow(game_id=1, display_name=None, player_name="Alice", has_messages=True, is_inferred_town_candidate=False),
+            UndefinedPlayerRow(game_id=1, display_name=None, player_name="Bob", has_messages=True, is_inferred_town_candidate=False),
+        ]
+
+        with (
+            patch("mafia_framework.services.game_service.find_undefined_players", return_value=rows),
+            patch("mafia_framework.services.game_service.assign_player_role") as mock_assign,
+            patch("builtins.input", side_effect=["", "not_a_role"]),
+        ):
+            asyncio.run(bot._prompt_for_undefined_roles("dummy.db", 1))
+
+        mock_assign.assert_not_called()
+
+    def test_prompt_for_undefined_roles_noop_when_none_undefined(self):
+        bot = MafiaBot.__new__(MafiaBot)
+
+        with (
+            patch("mafia_framework.services.game_service.find_undefined_players", return_value=[]),
+            patch("builtins.input") as mock_input,
+        ):
+            asyncio.run(bot._prompt_for_undefined_roles("dummy.db", 1))
+
+        mock_input.assert_not_called()

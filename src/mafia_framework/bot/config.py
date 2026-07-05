@@ -7,6 +7,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from ..paths import resolve_repo_path
+
 # Python 3.11+ has tomllib, fall back to toml package for older versions if needed
 if sys.version_info >= (3, 11):
     import tomllib
@@ -32,9 +34,10 @@ class GameplayConfig:
     autojoin: bool = True
     min_confidence_to_vote: float = 0.55
     night_idle: bool = True
-    update_suspicion_frequency_seconds: float = 60.0
     min_seconds_between_vote_actions: float = 3.0
     random_vote_chance: float = 0.4
+    vote_comment_chance: float = 0.5
+    town_read_comment_chance: float = 0.5
 
 
 @dataclass
@@ -52,15 +55,7 @@ class BotConfig:
 
     @classmethod
     def load_from_file(cls, path: str | Path) -> BotConfig:
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            cwd_candidate = Path.cwd() / candidate
-            if cwd_candidate.exists():
-                candidate = cwd_candidate
-            else:
-                repo_candidate = Path(__file__).resolve().parents[2] / candidate
-                if repo_candidate.exists():
-                    candidate = repo_candidate
+        candidate = resolve_repo_path(path)
 
         data = {}
         if candidate.exists():
@@ -88,13 +83,14 @@ class BotConfig:
                 autojoin=gameplay_data.get("autojoin", True),
                 min_confidence_to_vote=float(gameplay_data.get("min_confidence_to_vote", 0.55)),
                 night_idle=gameplay_data.get("night_idle", True),
-                update_suspicion_frequency_seconds=float(gameplay_data.get("update_suspicion_frequency_seconds", 60.0)),
                 min_seconds_between_vote_actions=float(gameplay_data.get("min_seconds_between_vote_actions", 3.0)),
                 random_vote_chance=float(gameplay_data.get("random_vote_chance", 0.4)),
+                vote_comment_chance=float(gameplay_data.get("vote_comment_chance", 0.5)),
+                town_read_comment_chance=float(gameplay_data.get("town_read_comment_chance", 0.5)),
             ),
             database=DatabaseConfig(
-                db_path=database_data.get("db_path", "data/mafia.db"),
-                model_path=database_data.get("model_path", "data/model.pkl"),
-                model_d1_path=database_data.get("model_d1_path", "data/model_d1.pkl"),
+                db_path=str(resolve_repo_path(database_data.get("db_path", "data/mafia.db"))),
+                model_path=str(resolve_repo_path(database_data.get("model_path", "data/model.pkl"))),
+                model_d1_path=str(resolve_repo_path(database_data.get("model_d1_path", "data/model_d1.pkl"))),
             ),
         )

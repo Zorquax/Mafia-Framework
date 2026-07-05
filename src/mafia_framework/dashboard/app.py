@@ -40,12 +40,16 @@ from mafia_framework.services.model_service import (
 )
 from mafia_framework.services.tell_service import get_session_tells, list_canonical_players
 from mafia_framework.analysis.tells import DAY_ONE_FEATURE_NAMES, FEATURE_NAMES
+from mafia_framework.paths import resolve_repo_path
 
 
 def _init_state() -> None:
-    st.session_state.setdefault("db_path", "data/mafia.db")
-    st.session_state.setdefault("model_path", "data/model.pkl")
-    st.session_state.setdefault("model_d1_path", "data/model_d1.pkl")
+    # Resolved eagerly (rather than left as a bare relative string) so the
+    # dashboard finds the real database/models regardless of which
+    # directory `streamlit run` was launched from.
+    st.session_state.setdefault("db_path", str(resolve_repo_path("data/mafia.db")))
+    st.session_state.setdefault("model_path", str(resolve_repo_path("data/model.pkl")))
+    st.session_state.setdefault("model_d1_path", str(resolve_repo_path("data/model_d1.pkl")))
 
 
 def _sidebar_config() -> tuple[str, str, str]:
@@ -63,9 +67,9 @@ def _sidebar_config() -> tuple[str, str, str]:
             "Aliases",
         ],
     )
-    db_path = st.sidebar.text_input("Database path", st.session_state["db_path"])
-    model_path = st.sidebar.text_input("Full model path", st.session_state["model_path"])
-    model_d1_path = st.sidebar.text_input("Day 1 model path", st.session_state["model_d1_path"])
+    db_path = str(resolve_repo_path(st.sidebar.text_input("Database path", st.session_state["db_path"])))
+    model_path = str(resolve_repo_path(st.sidebar.text_input("Full model path", st.session_state["model_path"])))
+    model_d1_path = str(resolve_repo_path(st.sidebar.text_input("Day 1 model path", st.session_state["model_d1_path"])))
     st.session_state["db_path"] = db_path
     st.session_state["model_path"] = model_path
     st.session_state["model_d1_path"] = model_d1_path
