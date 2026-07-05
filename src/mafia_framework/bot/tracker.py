@@ -46,6 +46,11 @@ NIGHT_START_RE = re.compile(
 # (e.g. "Day 5. The hammer count is set at 3")
 HAMMER_COUNT_RE = re.compile(r"hammer\s+count\s+is\s+set\s+at\s+(?P<hammer>\d+)", re.IGNORECASE)
 
+# The room automatically posts these as the day's deadline approaches, e.g.
+# "**3 minutes left!**" / "**1 minute left!**"
+THREE_MIN_LEFT_RE = re.compile(r"3\s*minutes?\s*left", re.IGNORECASE)
+ONE_MIN_LEFT_RE = re.compile(r"1\s*minute\s*left", re.IGNORECASE)
+
 class GameTracker:
     def __init__(self):
         self.state = "IDLE"  # IDLE, SIGNUPS, DAY, NIGHT
@@ -58,6 +63,7 @@ class GameTracker:
         self.dead_players: Set[str] = set()
         self.bot_username: Optional[str] = None
         self.hammer_count: Optional[int] = None
+        self.deadline_warning: Optional[str] = None  # None, "3_minutes", or "1_minute"
 
     @staticmethod
     def _normalize_message_text(line: str) -> str:
@@ -93,6 +99,7 @@ class GameTracker:
         self.eliminated = False
         self.dead_players = set()
         self.hammer_count = None
+        self.deadline_warning = None
 
     def process_message(self, line: str, bot_username: Optional[str] = None) -> Optional[str]:
         """
@@ -166,6 +173,27 @@ class GameTracker:
             if ELIMINATION_RE.search(clean_text):
                 self._prune_dead_players(bot_username=bot_username)
 
+            # Check for the room's automatic deadline warnings first, used to
+            # trigger re-evaluation at meaningful points in the day rather
+            # than on a fixed timer. These must be checked before the day
+            # marker below, since its generic "**"-prefixed pattern would
+            # otherwise swallow them (e.g. "**3 minutes left!**").
+            if self.state == "DAY":
+                if ONE_MIN_LEFT_RE.search(clean_text):
+                    already_warned = self.deadline_warning == "1_minute"
+                    self.deadline_warning = "1_minute"
+                    if already_warned:
+                        return None
+                    logger.info("Deadline warning: 1 minute left.")
+                    return "DEADLINE_1MIN"
+                if THREE_MIN_LEFT_RE.search(clean_text):
+                    already_warned = self.deadline_warning == "3_minutes"
+                    self.deadline_warning = "3_minutes"
+                    if already_warned:
+                        return None
+                    logger.info("Deadline warning: 3 minutes left.")
+                    return "DEADLINE_3MIN"
+
             # Check for day marker
             day_match = DAY_MARKER_RE.search(clean_text)
             if day_match:
@@ -176,6 +204,7 @@ class GameTracker:
                 hammer_match = HAMMER_COUNT_RE.search(clean_text)
                 if hammer_match:
                     self.hammer_count = int(hammer_match.group("hammer"))
+                self.deadline_warning = None
                 self._prune_dead_players()
                 logger.info(f"Phase change: Day {self.current_day}")
                 return "DAY"

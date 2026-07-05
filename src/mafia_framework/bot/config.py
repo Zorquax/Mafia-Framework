@@ -32,9 +32,10 @@ class GameplayConfig:
     autojoin: bool = True
     min_confidence_to_vote: float = 0.55
     night_idle: bool = True
-    update_suspicion_frequency_seconds: float = 60.0
     min_seconds_between_vote_actions: float = 3.0
     random_vote_chance: float = 0.4
+    vote_comment_chance: float = 0.5
+    town_read_comment_chance: float = 0.5
 
 
 @dataclass
@@ -88,9 +89,10 @@ class BotConfig:
                 autojoin=gameplay_data.get("autojoin", True),
                 min_confidence_to_vote=float(gameplay_data.get("min_confidence_to_vote", 0.55)),
                 night_idle=gameplay_data.get("night_idle", True),
-                update_suspicion_frequency_seconds=float(gameplay_data.get("update_suspicion_frequency_seconds", 60.0)),
                 min_seconds_between_vote_actions=float(gameplay_data.get("min_seconds_between_vote_actions", 3.0)),
                 random_vote_chance=float(gameplay_data.get("random_vote_chance", 0.4)),
+                vote_comment_chance=float(gameplay_data.get("vote_comment_chance", 0.5)),
+                town_read_comment_chance=float(gameplay_data.get("town_read_comment_chance", 0.5)),
             ),
             database=DatabaseConfig(
                 db_path=database_data.get("db_path", "data/mafia.db"),
