@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from mafia_framework.bot.client import MafiaBot
+from mafia_framework.bot.client import MafiaBot, RAGEBAIT_LINES
 from mafia_framework.bot.config import BotConfig
 from mafia_framework.bot.tracker import GameTracker
 from mafia_framework.bot.strategy import BotStrategy
@@ -269,7 +269,7 @@ class TestBotComponents(unittest.TestCase):
 
         asyncio.run(bot._maybe_claim_at_v1())
 
-        bot._send_chat_message.assert_awaited_once_with("I HARDCLAIM Vanilla Townie GET OFF")
+        bot._send_chat_message.assert_awaited_once_with("I HARDCLAIM Vanilla Townie get OFF")
         self.assertTrue(bot._claimed_this_day)
 
     def test_maybe_claim_at_v1_does_nothing_below_hammer_minus_one(self):
@@ -309,7 +309,7 @@ class TestBotComponents(unittest.TestCase):
 
         asyncio.run(bot._maybe_claim_at_v1())
 
-        bot._send_chat_message.assert_awaited_once_with("I HARDCLAIM Vanilla Townie GET OFF")
+        bot._send_chat_message.assert_awaited_once_with("I HARDCLAIM Vanilla Townie get OFF")
         self.assertTrue(bot._claimed_this_day)
 
     def test_evaluate_and_vote_announces_new_town_read(self):
@@ -689,7 +689,7 @@ class TestBotComponents(unittest.TestCase):
 
         asyncio.run(bot._maybe_claim_if_plurality_near_deadline())
 
-        bot._send_chat_message.assert_awaited_once_with("I HARDCLAIM Vanilla Townie GET OFF")
+        bot._send_chat_message.assert_awaited_once_with("I HARDCLAIM Vanilla Townie get OFF")
         self.assertTrue(bot._claimed_this_day)
 
     def test_maybe_claim_if_plurality_near_deadline_skips_when_already_claimed(self):
@@ -817,22 +817,63 @@ class TestBotComponents(unittest.TestCase):
 
     def test_get_claim_message_lies_as_vt_for_listed_roles(self):
         bot = MafiaBot.__new__(MafiaBot)
-        for role in ["Werewolf", "Alien", "Cult Leader", "Serial Killer", "Goo"]:
+        # Any Mafia-aligned role (not just a specific named one) plus a set
+        # of dangerous-to-reveal non-town roles from other alignments.
+        for role in [
+            "Werewolf", "Alien", "Cult Leader", "Serial Killer", "Goo",
+            "Mafia Goon", "Mafia Roleblocker", "Mafia Boss",
+        ]:
             bot._own_role = role
-            self.assertEqual(bot._get_claim_message(), "VT", msg=f"role={role}")
+            self.assertEqual(bot._get_claim_message(), "Vanilla Townie", msg=f"role={role}")
 
     def test_get_claim_message_claims_real_role_otherwise(self):
         bot = MafiaBot.__new__(MafiaBot)
         bot._own_role = "Vanilla Townie"
         self.assertEqual(bot._get_claim_message(), "Vanilla Townie")
 
-        bot._own_role = "Mafia Goon"
-        self.assertEqual(bot._get_claim_message(), "Mafia Goon")
+        bot._own_role = "Doctor"
+        self.assertEqual(bot._get_claim_message(), "Doctor")
 
     def test_get_claim_message_none_when_role_unknown(self):
         bot = MafiaBot.__new__(MafiaBot)
         bot._own_role = None
         self.assertIsNone(bot._get_claim_message())
+
+    def test_finished_event_sends_ragebait_after_gg(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot._random_actions_task = None
+        bot.tracker = SimpleNamespace(players=["Alice", "BotUser"], dead_players={"Bob"}, reset=Mock())
+        bot.strategy = Mock()
+        bot.config = SimpleNamespace(
+            gameplay=SimpleNamespace(silent_mode=False),
+            showdown=SimpleNamespace(username="BotUser"),
+        )
+        bot.send_room_command = AsyncMock()
+        bot._send_chat_message = AsyncMock()
+        bot._save_game_to_db = AsyncMock()
+
+        asyncio.run(bot._handle_tracker_event("FINISHED"))
+
+        bot.send_room_command.assert_awaited_once_with("gg")
+        bot._send_chat_message.assert_awaited_once()
+        sent_text = bot._send_chat_message.call_args[0][0]
+        matching_line = next(line for line in RAGEBAIT_LINES if sent_text.startswith(line))
+        self.assertEqual(sent_text, f"{matching_line} Alice Bob")
+
+    def test_finished_event_skips_ragebait_in_silent_mode(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot._random_actions_task = None
+        bot.tracker = Mock()
+        bot.strategy = Mock()
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(silent_mode=True))
+        bot.send_room_command = AsyncMock()
+        bot._send_chat_message = AsyncMock()
+        bot._save_game_to_db = AsyncMock()
+
+        asyncio.run(bot._handle_tracker_event("FINISHED"))
+
+        bot.send_room_command.assert_awaited_once_with("gg")
+        bot._send_chat_message.assert_not_awaited()
 
     def test_handle_pm_claim_uses_own_role(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -847,7 +888,7 @@ class TestBotComponents(unittest.TestCase):
 
         asyncio.run(bot._handle_pm("Alice", ".claim"))
 
-        bot.connection.send.assert_awaited_once_with("|/pm Alice, VT")
+        bot.connection.send.assert_awaited_once_with("|/pm Alice, Vanilla Townie")
 
     def test_handle_pm_claim_appends_1_to_hammer_when_actually_at_v1(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -1141,6 +1182,47 @@ class TestBotComponents(unittest.TestCase):
         self.assertIsNone(second_event)
         self.assertEqual(tracker.players, ["Alice", "BotUser"])
         self.assertTrue(tracker.in_game)
+
+    def test_spectate_broadcast_does_not_override_confirmed_in_game(self):
+        # Seen live: this "in progress / become a substitute / spectate"
+        # broadcast is sent generically to anyone joining/refreshing the
+        # room while a game is active -- including actual participants --
+        # and it arrived (in the backlog replay) AFTER the roster line that
+        # had already confirmed the bot was playing. It silently flipped
+        # in_game back to False, breaking every subsequent vote reaction,
+        # claim, and night action for a game the bot was still actually in.
+        tracker = GameTracker()
+        roster_line = "|c:|123|~|**Players (3)**: Alice, Bob, BotUser"
+        spectate_line = (
+            '|c:|124|~|/uhtml mafia,<div class="broadcast-blue">'
+            '<p style="font-weight: bold">A game of Mafia is in progress.</p>'
+            '<p><button class="button" name="send" value="/msgroom mafia,/mafia sub in">Become a substitute</button> '
+            '<button class="button" name="send" value="/join view-mafia-mafia">Spectate the game</button></p></div>'
+        )
+
+        event = tracker.process_message(roster_line, bot_username="BotUser")
+        self.assertEqual(event, "STARTED")
+        self.assertTrue(tracker.in_game)
+
+        second_event = tracker.process_message(spectate_line, bot_username="BotUser")
+        self.assertIsNone(second_event)
+        self.assertTrue(tracker.in_game)
+
+    def test_spectate_broadcast_still_applies_when_genuinely_not_playing(self):
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.in_game = False
+        spectate_line = (
+            '|c:|124|~|/uhtml mafia,<div class="broadcast-blue">'
+            '<p style="font-weight: bold">A game of Mafia is in progress.</p>'
+            '<p><button class="button" name="send" value="/msgroom mafia,/mafia sub in">Become a substitute</button> '
+            '<button class="button" name="send" value="/join view-mafia-mafia">Spectate the game</button></p></div>'
+        )
+
+        event = tracker.process_message(spectate_line, bot_username="BotUser")
+
+        self.assertIsNone(event)
+        self.assertFalse(tracker.in_game)
 
     def test_hammer_count_parsed_from_day_marker(self):
         tracker = GameTracker()
