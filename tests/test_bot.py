@@ -269,7 +269,7 @@ class TestBotComponents(unittest.TestCase):
 
         asyncio.run(bot._maybe_claim_at_v1())
 
-        bot._send_chat_message.assert_awaited_once_with("Vanilla Townie 1 to hammer")
+        bot._send_chat_message.assert_awaited_once_with("I HARDCLAIM Vanilla Townie GET OFF")
         self.assertTrue(bot._claimed_this_day)
 
     def test_maybe_claim_at_v1_does_nothing_below_hammer_minus_one(self):
@@ -309,7 +309,7 @@ class TestBotComponents(unittest.TestCase):
 
         asyncio.run(bot._maybe_claim_at_v1())
 
-        bot._send_chat_message.assert_awaited_once_with("Vanilla Townie 1 to hammer")
+        bot._send_chat_message.assert_awaited_once_with("I HARDCLAIM Vanilla Townie GET OFF")
         self.assertTrue(bot._claimed_this_day)
 
     def test_evaluate_and_vote_announces_new_town_read(self):
@@ -325,7 +325,7 @@ class TestBotComponents(unittest.TestCase):
         bot.config = SimpleNamespace(
             showdown=SimpleNamespace(username="BotUser"),
             database=SimpleNamespace(db_path="dummy.db"),
-            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0),
+            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0, silent_mode=False),
         )
         bot._current_vote_target = None
         bot._current_town_read = None
@@ -350,7 +350,7 @@ class TestBotComponents(unittest.TestCase):
         bot.config = SimpleNamespace(
             showdown=SimpleNamespace(username="BotUser"),
             database=SimpleNamespace(db_path="dummy.db"),
-            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0, volo_min_confidence=0.75),
+            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0, volo_min_confidence=0.75, silent_mode=False),
         )
         bot._current_vote_target = None
         bot._current_town_read = None
@@ -377,7 +377,7 @@ class TestBotComponents(unittest.TestCase):
         bot.config = SimpleNamespace(
             showdown=SimpleNamespace(username="BotUser"),
             database=SimpleNamespace(db_path="dummy.db"),
-            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0, volo_min_confidence=0.75),
+            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0, volo_min_confidence=0.75, silent_mode=False),
         )
         bot._current_vote_target = None
         bot._current_town_read = None
@@ -405,7 +405,7 @@ class TestBotComponents(unittest.TestCase):
         bot.config = SimpleNamespace(
             showdown=SimpleNamespace(username="BotUser"),
             database=SimpleNamespace(db_path="dummy.db"),
-            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0),
+            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0, silent_mode=False),
         )
         bot._current_vote_target = None
         bot._current_town_read = None
@@ -432,7 +432,7 @@ class TestBotComponents(unittest.TestCase):
         bot.config = SimpleNamespace(
             showdown=SimpleNamespace(username="BotUser"),
             database=SimpleNamespace(db_path="dummy.db"),
-            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0),
+            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0, silent_mode=False),
         )
         bot._current_vote_target = None
         bot._current_town_read = None
@@ -493,7 +493,7 @@ class TestBotComponents(unittest.TestCase):
         bot.config = SimpleNamespace(
             showdown=SimpleNamespace(username="BotUser"),
             database=SimpleNamespace(db_path="dummy.db"),
-            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0),
+            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0, silent_mode=False),
         )
         bot._current_vote_target = None
         bot._current_town_read = "Alice"
@@ -506,7 +506,7 @@ class TestBotComponents(unittest.TestCase):
 
     def test_cast_vote_with_optional_comment_silent_when_chance_is_zero(self):
         bot = MafiaBot.__new__(MafiaBot)
-        bot.config = SimpleNamespace(gameplay=SimpleNamespace(vote_comment_chance=0.0))
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(vote_comment_chance=0.0, silent_mode=False))
         bot._send_chat_message = AsyncMock()
         bot.send_room_command = AsyncMock()
 
@@ -517,7 +517,7 @@ class TestBotComponents(unittest.TestCase):
 
     def test_cast_vote_with_optional_comment_speaks_when_chance_is_one(self):
         bot = MafiaBot.__new__(MafiaBot)
-        bot.config = SimpleNamespace(gameplay=SimpleNamespace(vote_comment_chance=1.0))
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(vote_comment_chance=1.0, silent_mode=False))
         bot._send_chat_message = AsyncMock()
         bot.send_room_command = AsyncMock()
 
@@ -526,6 +526,94 @@ class TestBotComponents(unittest.TestCase):
 
         bot._send_chat_message.assert_awaited_once_with("I think Alice is scum")
         bot.send_room_command.assert_awaited_once_with("/mafia vote Alice")
+
+    def test_cast_vote_with_optional_comment_silent_mode_still_votes_without_narration(self):
+        # silent_mode must not stop the vote itself from happening -- only
+        # the narration around it.
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(vote_comment_chance=1.0, silent_mode=True))
+        bot._send_chat_message = AsyncMock()
+        bot.send_room_command = AsyncMock()
+
+        asyncio.run(bot._cast_vote_with_optional_comment("Alice"))
+
+        bot._send_chat_message.assert_not_awaited()
+        bot.send_room_command.assert_awaited_once_with("/mafia vote Alice")
+
+    def test_random_actions_loop_does_nothing_in_silent_mode(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(silent_mode=True))
+        bot.tracker = SimpleNamespace(state="DAY", in_game=True, eliminated=False)
+        bot._send_chat_message = AsyncMock()
+
+        asyncio.run(bot._random_actions_loop())
+
+        bot._send_chat_message.assert_not_awaited()
+
+    def test_random_actions_loop_sends_at_most_one_message_per_cycle(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(silent_mode=False))
+        bot.tracker = SimpleNamespace(state="DAY", in_game=True, eliminated=False)
+        bot._remembered_lines = ["some line"]
+
+        async def stop_after_one_message(*args, **kwargs):
+            bot.tracker.state = "NIGHT"
+
+        bot._send_chat_message = AsyncMock(side_effect=stop_after_one_message)
+
+        with patch("mafia_framework.bot.client.asyncio.sleep", new=AsyncMock()), \
+             patch("random.choices", return_value=["filler"]):
+            asyncio.run(bot._random_actions_loop())
+
+        bot._send_chat_message.assert_awaited_once()
+
+    def test_random_actions_loop_none_action_stays_quiet(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(silent_mode=False))
+        tracker = SimpleNamespace(state="DAY", in_game=True, eliminated=False)
+        bot.tracker = tracker
+        bot._remembered_lines = []
+        bot._send_chat_message = AsyncMock()
+
+        sleep_calls = 0
+
+        async def fake_sleep(_):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls >= 2:
+                tracker.state = "NIGHT"
+
+        with patch("mafia_framework.bot.client.asyncio.sleep", new=fake_sleep), \
+             patch("random.choices", return_value=["none"]):
+            asyncio.run(bot._random_actions_loop())
+
+        bot._send_chat_message.assert_not_awaited()
+
+    def test_evaluate_and_vote_suppresses_town_read_announcement_in_silent_mode(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
+        bot.tracker = SimpleNamespace(
+            state="DAY", eliminated=False, in_game=True,
+            get_game_session=Mock(return_value=session),
+        )
+        bot.strategy = Mock()
+        bot.strategy.get_vote_decision = Mock(return_value=(None, 0.0))
+        bot.strategy.get_town_read = Mock(return_value=("Alice", 0.90))
+        bot.config = SimpleNamespace(
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+            gameplay=SimpleNamespace(town_read_comment_chance=1.0, vote_comment_chance=1.0, silent_mode=True),
+        )
+        bot._current_vote_target = None
+        bot._current_town_read = None
+        bot._send_chat_message = AsyncMock()
+        bot.send_room_command = AsyncMock()
+
+        asyncio.run(bot._evaluate_and_vote())
+
+        bot._send_chat_message.assert_not_awaited()
+        # The read is still tracked internally even though it isn't announced.
+        self.assertEqual(bot._current_town_read, "Alice")
 
     def test_deadline_events_trigger_reevaluation(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -540,9 +628,10 @@ class TestBotComponents(unittest.TestCase):
 
     def test_started_event_requests_role_and_original_rolelist(self):
         bot = MafiaBot.__new__(MafiaBot)
-        bot.tracker = SimpleNamespace(in_game=True)
+        bot.tracker = SimpleNamespace(state="NIGHT", in_game=True, eliminated=False)
         bot.strategy = Mock()
         bot.strategy.reset = Mock()
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(silent_mode=False))
         bot._random_actions_task = None
         bot.send_room_command = AsyncMock()
 
@@ -600,7 +689,7 @@ class TestBotComponents(unittest.TestCase):
 
         asyncio.run(bot._maybe_claim_if_plurality_near_deadline())
 
-        bot._send_chat_message.assert_awaited_once_with("Vanilla Townie")
+        bot._send_chat_message.assert_awaited_once_with("I HARDCLAIM Vanilla Townie GET OFF")
         self.assertTrue(bot._claimed_this_day)
 
     def test_maybe_claim_if_plurality_near_deadline_skips_when_already_claimed(self):
@@ -614,6 +703,38 @@ class TestBotComponents(unittest.TestCase):
         asyncio.run(bot._maybe_claim_if_plurality_near_deadline())
 
         bot._send_chat_message.assert_not_awaited()
+
+    def test_delayed_plurality_claim_check_checks_every_configured_checkpoint(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(state="DAY", in_game=True, eliminated=False)
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(plurality_claim_check_seconds=[30.0, 20.0, 10.0, 5.0]))
+        bot._claimed_this_day = False
+        bot.send_room_command = AsyncMock()
+        bot._maybe_claim_if_plurality_near_deadline = AsyncMock()
+
+        with patch("mafia_framework.bot.client.asyncio.sleep", new=AsyncMock()):
+            asyncio.run(bot._delayed_plurality_claim_check())
+
+        self.assertEqual(bot._maybe_claim_if_plurality_near_deadline.call_count, 4)
+        self.assertEqual(bot.send_room_command.call_count, 4)
+        bot.send_room_command.assert_any_call("/mafia votes")
+
+    def test_delayed_plurality_claim_check_stops_once_claimed(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(state="DAY", in_game=True, eliminated=False)
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(plurality_claim_check_seconds=[30.0, 20.0, 10.0, 5.0]))
+        bot._claimed_this_day = False
+        bot.send_room_command = AsyncMock()
+
+        async def claim_side_effect():
+            bot._claimed_this_day = True
+
+        bot._maybe_claim_if_plurality_near_deadline = AsyncMock(side_effect=claim_side_effect)
+
+        with patch("mafia_framework.bot.client.asyncio.sleep", new=AsyncMock()):
+            asyncio.run(bot._delayed_plurality_claim_check())
+
+        self.assertEqual(bot._maybe_claim_if_plurality_near_deadline.call_count, 1)
 
     def test_deadline_1min_schedules_plurality_claim_check(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -879,6 +1000,76 @@ class TestBotComponents(unittest.TestCase):
         self.assertIn("Alice", prompt)
         self.assertNotIn("Bob", prompt)
 
+    def test_question_prompt_rallies_players_onto_current_vote_target(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = GameTracker()
+        bot.tracker.state = "DAY"
+        bot.tracker.players = ["Alice", "Bob", "Carl"]
+        bot.tracker.in_game = True
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot._current_vote_target = "Carl"
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob", "Carl"])
+
+        with patch("random.random", return_value=0.0), patch("random.choice", side_effect=lambda pool: pool[0]):
+            prompt = bot._build_question_prompt(session)
+
+        self.assertEqual(prompt, "Alice vote Carl with me")
+
+    def test_question_prompt_rally_excludes_the_vote_target_itself(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = GameTracker()
+        bot.tracker.state = "DAY"
+        bot.tracker.players = ["Alice", "Carl"]
+        bot.tracker.in_game = True
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot._current_vote_target = "Carl"
+        session = GameSession(source="test", raw_text="", players=["Alice", "Carl"])
+
+        with patch("random.random", return_value=0.0), patch("random.choice", side_effect=lambda pool: pool[0]):
+            prompt = bot._build_question_prompt(session)
+
+        self.assertEqual(prompt, "Alice vote Carl with me")
+        self.assertNotIn("Carl vote Carl", prompt)
+
+    def test_question_prompt_skips_rally_without_a_current_vote_target(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = GameTracker()
+        bot.tracker.state = "DAY"
+        bot.tracker.players = ["Alice", "Bob"]
+        bot.tracker.in_game = True
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot._current_vote_target = None
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
+
+        with patch("random.random", return_value=0.0), patch("random.choices", return_value=[1]), patch("random.sample", side_effect=lambda items, k: items[:k]):
+            prompt = bot._build_question_prompt(session)
+
+        self.assertNotIn("with me", prompt)
+
+    def test_started_event_clears_remembered_lines(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(state="NIGHT", in_game=False, eliminated=False)
+        bot.strategy = Mock()
+        bot.strategy.reset = Mock()
+        bot.config = SimpleNamespace(gameplay=SimpleNamespace(silent_mode=False))
+        bot._random_actions_task = None
+        bot._remembered_lines = ["something said before the game started"]
+
+        asyncio.run(bot._handle_tracker_event("STARTED"))
+
+        self.assertEqual(bot._remembered_lines, [])
+
+    def test_save_game_to_db_handles_no_stdin_gracefully(self):
+        # Running headless/backgrounded means there's no terminal to answer
+        # the save-confirmation prompt -- input() raises EOFError, which
+        # must not escape and crash the message-processing loop.
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="some raw log text", players=["Alice", "Bob"])
+        bot.tracker = SimpleNamespace(get_game_session=Mock(return_value=session))
+
+        with patch("builtins.input", side_effect=EOFError):
+            asyncio.run(bot._save_game_to_db())
+
     def test_tracker_marks_bot_eliminated_when_its_name_is_in_elimination_line(self):
         tracker = GameTracker()
         tracker.state = "DAY"
@@ -907,6 +1098,49 @@ class TestBotComponents(unittest.TestCase):
         self.assertTrue(tracker.eliminated)
         self.assertFalse(tracker.in_game)
         self.assertEqual(tracker.hammer_count, 2)
+
+    def test_reset_clears_raw_history_so_old_game_eliminations_dont_leak(self):
+        # _prune_dead_players re-scans the entire raw_text_history on every
+        # call. If reset() doesn't clear it, a stale elimination line from a
+        # previous completed game (including one eliminating the bot itself)
+        # would get re-detected as soon as the next game's first day marker
+        # fires, silently marking the bot as already-eliminated in a brand
+        # new game it's actually alive in.
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["Alice", "BotUser"]
+        tracker.in_game = True
+
+        tracker.process_message("|c:|1|~|BotUser was eliminated!", bot_username="BotUser")
+        self.assertTrue(tracker.eliminated)
+
+        tracker.reset()
+        self.assertEqual(tracker.raw_text_history, [])
+
+        # A brand new game starts and the bot is alive and playing.
+        tracker.state = "DAY"
+        tracker.players = ["Carl", "BotUser"]
+        tracker.in_game = True
+        tracker.process_message("Day 2. The hammer count is set at 2", bot_username="BotUser")
+
+        self.assertFalse(tracker.eliminated)
+        self.assertTrue(tracker.in_game)
+        self.assertIn("BotUser", tracker.players)
+
+    def test_duplicate_roster_broadcast_does_not_refire_started(self):
+        # Seen live: the room re-broadcasts the exact same "**Players (N)**:"
+        # line twice around game start (once at roster lock, once at the
+        # actual start). The second one must not look like a brand new game.
+        tracker = GameTracker()
+        roster_line = "|c:|123|~|**Players (2)**: Alice, BotUser"
+
+        first_event = tracker.process_message(roster_line, bot_username="BotUser")
+        self.assertEqual(first_event, "STARTED")
+
+        second_event = tracker.process_message(roster_line, bot_username="BotUser")
+        self.assertIsNone(second_event)
+        self.assertEqual(tracker.players, ["Alice", "BotUser"])
+        self.assertTrue(tracker.in_game)
 
     def test_hammer_count_parsed_from_day_marker(self):
         tracker = GameTracker()

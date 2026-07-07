@@ -125,6 +125,12 @@ class GameTracker:
         self.state = "IDLE"
         self.players = []
         self.accumulated_lines = []
+        # _prune_dead_players re-scans this on every call to find eliminations
+        # -- if it isn't cleared here, a stale "X was eliminated!" line from a
+        # previous completed game keeps getting re-detected in every future
+        # game (and if X was ever the bot itself, a brand new game would get
+        # silently marked as already-eliminated for the bot).
+        self.raw_text_history = []
         self.current_day = 1
         self.in_game = False
         self.eliminated = False
@@ -220,6 +226,15 @@ class GameTracker:
             from ..io.parser import parse_players_list
             parsed_players = parse_players_list(line)
             if parsed_players:
+                if parsed_players == self.players and self.state in {"DAY", "NIGHT"}:
+                    # The room sometimes re-broadcasts the exact same roster
+                    # line twice around game start (e.g. once at roster
+                    # lock, once when the game actually begins) -- treating
+                    # a byte-identical repeat as a brand new game would
+                    # re-fire every per-game reset (claimed_this_day,
+                    # current vote/town read, remembered lines) mid-game.
+                    self.accumulated_lines.append(line)
+                    return None
                 self.players = parsed_players
                 self.state = "DAY"
                 self.accumulated_lines.append(line)
