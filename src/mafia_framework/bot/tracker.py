@@ -214,9 +214,18 @@ class GameTracker:
             return None
 
         if SPECTATE_STATE_RE.search(clean_text):
-            self.in_game = False
-            self.eliminated = False
-            logger.info("Detected spectate-only mafia state; bot is not participating.")
+            # This "in progress / become a substitute / spectate" broadcast
+            # is sent generically to anyone joining or refreshing the room
+            # while a game is active -- including actual participants, not
+            # just spectators. It doesn't reliably mean "we specifically are
+            # not playing", so it must never override an in_game=True that
+            # was already established from an authoritative roster match
+            # (this was silently breaking every subsequent action -- vote
+            # reactions, claims, night actions -- for a game the bot was
+            # genuinely still playing in).
+            if not self.in_game:
+                self.eliminated = False
+                logger.info("Detected spectate-only mafia state; bot is not participating.")
             return None
 
         # Check for player roster list (signifies game start / active players)

@@ -22,8 +22,12 @@ OWN_ROLE_PM_RE = re.compile(r"^(?P<name>.+?),\s*you\s+are\s+an?\s+(?P<role>.+?)\
 # |c|~|/raw <div class="infobox">Your role is: Mafia Goon</div>
 OWN_ROLE_BOX_RE = re.compile(r"Your\s+role\s+is:?\s*(?P<role>.+?)</div>", re.IGNORECASE)
 
-# Roles the bot should claim VT (Vanilla Townie) for instead of its real role.
-LIE_AS_VT_ROLE_RE = re.compile(r"\b(werewolf|alien|cult\w*|serial\s+killer|goo)\b", re.IGNORECASE)
+# Roles the bot should claim VT (Vanilla Townie) for instead of its real
+# role -- any Mafia-aligned role (e.g. "Mafia Goon"), plus specific
+# dangerous-to-reveal non-town roles from other alignments. "goo" alone
+# wouldn't match "Mafia Goon" (no word boundary between "goo" and "n"), but
+# that's covered by the "mafia" keyword now anyway.
+LIE_AS_VT_ROLE_RE = re.compile(r"\b(mafia|werewolf|alien|cult\w*|serial\s+killer|goo)\b", re.IGNORECASE)
 
 VALID_ALIGNMENTS = {"town", "mafia", "neutral", "unknown"}
 
@@ -50,6 +54,26 @@ REACTION_PHRASES = [
     "im watching this",
     "curious line ngl",
     "this is telling",
+]
+
+# Sent (after "gg") once a game finishes, regardless of outcome -- just for
+# flavor, not tied to whether the bot's side actually won.
+RAGEBAIT_LINES = [
+    "gg easy",
+    "yall really thought",
+    "cooked as usual",
+    "better luck next time i guess",
+    "not even close tbh",
+    "yall need a new strategy fr",
+    "another one, couldn't be me",
+    "somebody carry the team next time",
+    "was that supposed to be hard",
+    "ez clap",
+    "yall are actually bad at this game ngl",
+    "skill issue",
+    "carried again",
+    "this game was free",
+    "gg go next",
 ]
 
 
@@ -173,15 +197,18 @@ class MafiaBot:
     def _get_claim_message(self) -> Optional[str]:
         """Builds the claim text from the bot's own (live) role.
 
-        Lies and claims VT for roles that would be too costly to reveal
-        while alive; claims honestly otherwise. "1 to hammer" is a separate
-        condition (see _is_at_v1), not part of the claim itself.
+        Lies and claims Vanilla Townie for roles that would be too costly
+        to reveal while alive; claims honestly otherwise. Spelled out in
+        full rather than abbreviated "VT" -- capitalization/abbreviation
+        quirks in the shorthand made it read as an obvious fakeclaim.
+        "1 to hammer" is a separate condition (see _is_at_v1), not part of
+        the claim itself.
         """
         if not self._own_role:
             return None
 
         if LIE_AS_VT_ROLE_RE.search(self._own_role):
-            return "VT"
+            return "Vanilla Townie"
         return self._own_role
 
     @staticmethod
@@ -241,7 +268,7 @@ class MafiaBot:
         genuine danger of being hammered, as opposed to the calm, plain
         answer given to a direct `.claim` PM.
         """
-        return f"I HARDCLAIM {claim_message} GET OFF"
+        return f"I HARDCLAIM {claim_message} get OFF"
 
     async def _maybe_claim_at_v1(self):
         """Proactively claims in room chat once the bot is one vote from being hammered."""
@@ -386,7 +413,11 @@ class MafiaBot:
 
     async def send_room_command(self, command: str):
         msg = f"{self.connection.room}|{command}"
-        print(f"\n>>> EXECUTING COMMAND: {msg}\n")
+        # print() is fully buffered once stdout isn't a TTY (e.g. redirected
+        # to a log file for a backgrounded run), so it can sit unflushed and
+        # make it look like a command was never sent even though it was --
+        # logger.info flushes per record and doesn't have that blind spot.
+        logger.info(f"Executing command: {msg}")
         await self.connection.send(msg)
 
     async def _send_chat_message(self, text: str):
@@ -599,6 +630,22 @@ class MafiaBot:
 
             logger.info("Game finished. Sending gg message.")
             await self.send_room_command("gg")
+
+            if not self.config.gameplay.silent_mode:
+                from ..io.player_names import names_match
+
+                # Union of currently-alive and eliminated so everyone who
+                # actually played gets highlighted, not just survivors --
+                # the tracker prunes eliminated players out of .players as
+                # the game goes on.
+                all_players = list(dict.fromkeys(list(self.tracker.players) + list(self.tracker.dead_players)))
+                other_players = [p for p in all_players if not names_match(p, self.config.showdown.username)]
+
+                ragebait = random.choice(RAGEBAIT_LINES)
+                if other_players:
+                    ragebait = f"{ragebait} {' '.join(other_players)}"
+                logger.info(f"Ragebaiting after game end: {ragebait}")
+                await self._send_chat_message(ragebait)
 
             # Log completed game to database
             await self._save_game_to_db()
