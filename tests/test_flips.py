@@ -43,7 +43,7 @@ class TestFlips(unittest.TestCase):
 
         flips = extract_flips(raw)
         self.assertEqual(len(flips), 2)
-        self.assertEqual({flip.player_name for flip in flips}, {"CrespoXY", "mist"})
+        self.assertEqual({flip.player_name for flip in flips}, {"Crespo XY", "mist"})
         self.assertEqual({flip.alignment for flip in flips}, {"town"})
 
     def test_extract_flips_handles_elimination_and_reveal_in_one_sentence(self):

@@ -11,7 +11,11 @@ min_confidence_to_vote = 0.55
 night_idle = true
 vote_comment_chance = 0.5
 town_read_comment_chance = 0.5
+vote_reaction_chance = 0.5
 first_evaluation_delay_seconds = 60.0
+plurality_claim_check_seconds = [30.0, 20.0, 10.0, 5.0]
+volo_min_confidence = 0.75
+silent_mode = false
 
 [database]
 db_path = "data/mafia.db"

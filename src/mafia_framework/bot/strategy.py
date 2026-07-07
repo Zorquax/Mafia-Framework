@@ -84,11 +84,18 @@ class BotStrategy:
 
         return scored_players
 
-    def get_vote_decision(self, session: GameSession, bot_username: str, db_path: str) -> Tuple[Optional[str], float]:
+    def get_vote_decision(
+        self, session: GameSession, bot_username: str, db_path: str, min_confidence: Optional[float] = None
+    ) -> Tuple[Optional[str], float]:
         """
         Analyzes the GameSession and returns (target_player, probability).
         If no player meets the criteria, returns (None, 0.0).
+
+        `min_confidence` optionally overrides self.min_confidence for this
+        call only (e.g. a stricter bar during VoLo, where a wrong lynch
+        loses the game outright), without mutating shared strategy state.
         """
+        effective_confidence = self.min_confidence if min_confidence is None else min_confidence
         scored_players = self._score_players(session, bot_username, db_path)
 
         # Sort by adjusted probability descending
@@ -101,10 +108,10 @@ class BotStrategy:
         target, prob = scored_players[0]
         logger.info(f"Top suspect: {target} with probability: {prob:.4f}")
 
-        if prob >= self.min_confidence:
+        if prob >= effective_confidence:
             return target, prob
         else:
-            logger.info(f"Top suspect probability ({prob:.4f}) is below min confidence ({self.min_confidence})")
+            logger.info(f"Top suspect probability ({prob:.4f}) is below min confidence ({effective_confidence})")
             return None, prob
 
     def get_full_predictions(self, session: GameSession, bot_username: str, db_path: str) -> list[Tuple[str, float]]:

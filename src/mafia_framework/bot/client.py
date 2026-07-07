@@ -27,6 +27,31 @@ LIE_AS_VT_ROLE_RE = re.compile(r"\b(werewolf|alien|cult\w*|serial\s+killer|goo)\
 
 VALID_ALIGNMENTS = {"town", "mafia", "neutral", "unknown"}
 
+# Short reactions appended to a remembered line when repeating it, so it
+# reads as commenting on what someone said rather than just parroting it.
+REACTION_PHRASES = [
+    "i dont really like this line",
+    "elaborate?",
+    "hmmm",
+    "not sure how i feel about this",
+    "interesting take",
+    "explain this more",
+    "this is suspicious ngl",
+    "wait what",
+    "this reads weird to me",
+    "keep this in mind",
+    "noted",
+    "huh",
+    "thats a weird thing to say",
+    "why say this",
+    "ok and?",
+    "this aint it",
+    "rethink this one",
+    "im watching this",
+    "curious line ngl",
+    "this is telling",
+]
+
 
 class MafiaBot:
     def __init__(self, config_path: str):
@@ -74,6 +99,20 @@ class MafiaBot:
         return bool(target) and names_match(target, bot_username)
 
     @staticmethod
+    def _extract_vote_voter_name(line: str) -> Optional[str]:
+        """Pulls the voter's name out of a "X has voted Y." line, so a
+        catchphrase can reference who voted (e.g. "get off me {voter}").
+        """
+        from ..io.player_names import canonical_player_name
+
+        message_text = MafiaBot._message_text_from_line(line)
+        match = VOTE_TARGET_RE.search(message_text)
+        if not match:
+            return None
+        voter = canonical_player_name(match.group("voter"))
+        return voter or None
+
+    @staticmethod
     def _parse_own_role_box(line: str) -> Optional[str]:
         """Parses the private "/mafia role" query response, e.g.
         |c|~|/raw <div class="infobox">Your role is: Mafia Goon</div>
@@ -84,11 +123,12 @@ class MafiaBot:
         role_text = re.sub(r"<[^>]*>", "", match.group("role")).strip()
         return role_text or None
 
-    def _get_strategy_vote(self, session) -> tuple[Optional[str], float]:
+    def _get_strategy_vote(self, session, min_confidence: Optional[float] = None) -> tuple[Optional[str], float]:
         return self.strategy.get_vote_decision(
             session,
             bot_username=self.config.showdown.username,
             db_path=self.config.database.db_path,
+            min_confidence=min_confidence,
         )
 
     def _get_strategy_town_read(self, session) -> tuple[Optional[str], float]:
@@ -112,21 +152,19 @@ class MafiaBot:
         return " | ".join(f"{name} {prob:.0%}" for name, prob in predictions)
 
     def _get_bot_alignment(self, session) -> Optional[str]:
-        from ..io.player_names import canonical_player_name
+        from ..io.player_names import names_match
 
-        bot_clean = canonical_player_name(self.config.showdown.username)
         for flip in session.flips:
-            if canonical_player_name(flip.player_name) == bot_clean:
+            if names_match(flip.player_name, self.config.showdown.username):
                 return flip.alignment.lower().strip() or None
         return None
 
     def _get_random_live_player(self) -> Optional[str]:
-        from ..io.player_names import canonical_player_name
+        from ..io.player_names import names_match
 
-        bot_clean = canonical_player_name(self.config.showdown.username)
         live_players = [
             player for player in getattr(self.tracker, "players", [])
-            if canonical_player_name(player) != bot_clean and player not in self.tracker.dead_players
+            if not names_match(player, self.config.showdown.username) and player not in self.tracker.dead_players
         ]
         if not live_players:
             return None
@@ -173,12 +211,21 @@ class MafiaBot:
         return counts
 
     def _get_bot_vote_count(self, session) -> int:
-        from ..io.player_names import canonical_player_name
+        from ..io.player_names import names_match
+
+        # Prefer the authoritative tally from a parsed `/mafia votes` reply
+        # over one reconstructed from individually-parsed chat lines, which
+        # can miss or misparse a vote.
+        live_counts = getattr(self.tracker, "live_vote_counts", None)
+        if live_counts:
+            return next(
+                (count for target, count in live_counts.items() if names_match(target, self.config.showdown.username)),
+                0,
+            )
 
         counts = self._compute_live_vote_counts(session)
-        bot_clean = canonical_player_name(self.config.showdown.username)
         return next(
-            (count for target, count in counts.items() if canonical_player_name(target) == bot_clean),
+            (count for target, count in counts.items() if names_match(target, self.config.showdown.username)),
             0,
         )
 
@@ -187,6 +234,14 @@ class MafiaBot:
         if self.tracker.hammer_count is None:
             return False
         return self._get_bot_vote_count(session) == self.tracker.hammer_count - 1
+
+    @staticmethod
+    def _build_hardclaim_message(claim_message: str) -> str:
+        """Formats an urgent public room claim -- used when the bot is in
+        genuine danger of being hammered, as opposed to the calm, plain
+        answer given to a direct `.claim` PM.
+        """
+        return f"I HARDCLAIM {claim_message} GET OFF"
 
     async def _maybe_claim_at_v1(self):
         """Proactively claims in room chat once the bot is one vote from being hammered."""
@@ -201,21 +256,129 @@ class MafiaBot:
         if not claim_message:
             return
 
-        full_message = f"{claim_message} 1 to hammer"
+        full_message = self._build_hardclaim_message(claim_message)
         logger.info(f"At v-1; claiming: {full_message}")
         self._claimed_this_day = True
         await self._send_chat_message(full_message)
 
+    def _is_plurality_target(self) -> bool:
+        """True if the bot currently holds the most votes (or is tied for
+        the lead) in the live `/mafia votes` tally -- distinct from
+        _is_at_v1, since a split vote can leave the leader well short of
+        hammer with the clock still running out.
+        """
+        from ..io.player_names import names_match
+
+        live_counts = getattr(self.tracker, "live_vote_counts", None)
+        if not live_counts:
+            return False
+
+        max_count = max(live_counts.values())
+        if max_count <= 0:
+            return False
+
+        bot_count = next(
+            (count for target, count in live_counts.items() if names_match(target, self.config.showdown.username)),
+            0,
+        )
+        return bot_count == max_count
+
+    async def _maybe_claim_if_plurality_near_deadline(self):
+        """Proactively claims if the bot is the current plurality target
+        with little time left in the day, even when it isn't exactly one
+        vote from being hammered (e.g. a 3-way split near the deadline).
+        """
+        if self._claimed_this_day:
+            return
+
+        if not self._is_plurality_target():
+            return
+
+        claim_message = self._get_claim_message()
+        if not claim_message:
+            return
+
+        full_message = self._build_hardclaim_message(claim_message)
+        logger.info(f"Plurality target with little time left; claiming: {full_message}")
+        self._claimed_this_day = True
+        await self._send_chat_message(full_message)
+
+    async def _delayed_plurality_claim_check(self):
+        """Repeatedly checks for a plurality claim as the day's deadline
+        closes in, at each of the configured seconds-remaining checkpoints
+        (relative to the "1 minute left" warning) -- e.g. 30s/20s/10s/5s --
+        rather than a single one-shot check. The vote tally can shift right
+        up to the last few seconds, and a single check can miss a plurality
+        that only appears (or was already gone) at that one moment.
+        """
+        checkpoints = sorted(self.config.gameplay.plurality_claim_check_seconds, reverse=True)
+        elapsed = 0.0
+        for seconds_remaining in checkpoints:
+            target_elapsed = max(0.0, 60.0 - seconds_remaining)
+            delay = target_elapsed - elapsed
+            if delay > 0:
+                await asyncio.sleep(delay)
+                elapsed = target_elapsed
+
+            if self._claimed_this_day:
+                return
+            if not (self.tracker.state == "DAY" and self.tracker.in_game and not self.tracker.eliminated):
+                return
+
+            # Actively re-check the room's tally rather than trusting
+            # whatever was last cached -- the response updates
+            # tracker.live_vote_counts asynchronously, so give it a brief
+            # moment to arrive before acting on it.
+            await self.send_room_command("/mafia votes")
+            await asyncio.sleep(1.5)
+            await self._maybe_claim_if_plurality_near_deadline()
+
+    @staticmethod
+    def _count_mafia_roles(role_tokens: list[str]) -> int:
+        return sum(1 for token in role_tokens if "mafia" in token.lower())
+
+    def _is_volo(self, session) -> bool:
+        """True once mafia has (or is one death away from) parity with the
+        rest of the alive players -- the point where a wrong lynch can lose
+        the game outright.
+
+        Computed from the `/mafia originalrolelist` breakdown (mafia count
+        vs total roles) minus mafia deaths confirmed via flips, rather than
+        needing to know which living player holds which role.
+        """
+        from ..io.player_names import player_identity_key
+
+        role_tokens = getattr(self.tracker, "original_role_tokens", None)
+        if not role_tokens:
+            return False
+
+        mafia_total = self._count_mafia_roles(role_tokens)
+        if mafia_total <= 0:
+            return False
+
+        dead_keys = {player_identity_key(p) for p in self.tracker.dead_players}
+        mafia_confirmed_dead = sum(
+            1 for flip in session.flips
+            if flip.alignment.lower().strip() == "mafia"
+            and player_identity_key(flip.player_name) in dead_keys
+        )
+        mafia_alive = mafia_total - mafia_confirmed_dead
+
+        alive_total = len(session.players)
+        if alive_total <= 0:
+            return False
+
+        return 2 * mafia_alive >= alive_total - 1
+
     def _choose_night_action_target(self, session) -> Optional[str]:
-        from ..io.player_names import canonical_player_name
+        from ..io.player_names import names_match
 
         alignment = self._get_bot_alignment(session)
         if not alignment or alignment in {"town", "unknown"}:
             return None
 
         alive_players = [p for p in session.players if p not in self.tracker.dead_players]
-        bot_clean = canonical_player_name(self.config.showdown.username)
-        valid_targets = [p for p in alive_players if canonical_player_name(p) != bot_clean]
+        valid_targets = [p for p in alive_players if not names_match(p, self.config.showdown.username)]
         if not valid_targets:
             return None
 
@@ -305,11 +468,35 @@ class MafiaBot:
                         logger.info("Autojoining Mafia game from live room update...")
                         await self.send_room_command("/mafia join")
 
-                    if self.tracker.state == "DAY" and self.tracker.in_game and not self.tracker.eliminated and self._is_vote_for_bot(line, self.config.showdown.username):
+                    if (
+                        not self.config.gameplay.silent_mode
+                        and self.tracker.state == "DAY"
+                        and self.tracker.in_game
+                        and not self.tracker.eliminated
+                        and self._is_vote_for_bot(line, self.config.showdown.username)
+                        and random.random() < self.config.gameplay.vote_reaction_chance
+                    ):
                         delay = random.uniform(2.0, 5.0)
                         logger.info(f"Delayed vote reaction by {delay:.2f}s")
                         await asyncio.sleep(delay)
-                        catchphrases = ["why me", "im town", "get off", "bruh", "they're gonna qh"]
+                        voter = self._extract_vote_voter_name(line)
+                        catchphrases = [
+                            "why me",
+                            "im town",
+                            "bruh",
+                            "they're gonna qh",
+                            "dude you have to trust me here",
+                            "this is a bad vote",
+                            "wrong read",
+                            "im not it chief",
+                            "big mistake voting me",
+                            "cmon really",
+                            "yall are wasting time on me",
+                            "not it",
+                        ]
+                        if voter:
+                            catchphrases.append(f"get off me {voter}")
+                            catchphrases.append(f"{voter} explain this vote")
                         await self._send_chat_message(random.choice(catchphrases))
 
                     if (
@@ -319,7 +506,11 @@ class MafiaBot:
                         and not self.tracker.eliminated
                         and "voted" in line.lower()
                     ):
-                        await self._maybe_claim_at_v1()
+                        # Ask the room for the authoritative tally rather than
+                        # relying on chat-line-derived counts; the reply
+                        # ("VOTES_UPDATE") is what actually triggers the
+                        # hammer-minus-one claim check once it arrives.
+                        await self.send_room_command("/mafia votes")
 
                     if event:
                         if self._ready_for_live_games:
@@ -349,8 +540,13 @@ class MafiaBot:
             self._current_town_read = None
             self._own_role = None
             self._claimed_this_day = False
+            # A line remembered before this game started (signups chatter,
+            # or leftover from a previous game) isn't commentary on anything
+            # happening in this game -- don't let it get quoted back later.
+            self._remembered_lines = []
             if self.tracker.in_game:
                 await self.send_room_command("/mafia role")
+                await self.send_room_command("/mafia originalrolelist")
             if not self._random_actions_task or self._random_actions_task.done():
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
 
@@ -361,13 +557,27 @@ class MafiaBot:
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
             asyncio.create_task(self._delayed_first_evaluation())
 
+        elif event == "VOTES_UPDATE":
+            if (
+                self.tracker.state == "DAY"
+                and self.tracker.in_game
+                and not self.tracker.eliminated
+            ):
+                await self._maybe_claim_at_v1()
+
         elif event in ("DEADLINE_3MIN", "DEADLINE_1MIN"):
             # The room only announces these two automatic warnings, so together
             # with the day-start evaluation above they give exactly the "3
             # times a day" re-evaluation cadence, tied to real game milestones
             # instead of a fixed timer.
             logger.info(f"Deadline warning ({event}); re-evaluating votes...")
-            await self._evaluate_and_vote()
+            # At 1 minute left, this is the last evaluation of the day -- take
+            # a random guess if still unsure, rather than sitting out the vote.
+            await self._evaluate_and_vote(allow_random_fallback=(event == "DEADLINE_1MIN"))
+            if event == "DEADLINE_1MIN":
+                # Catches a plurality-but-not-quite-v1 claim shortly before
+                # time actually runs out (e.g. a 3-way vote split).
+                asyncio.create_task(self._delayed_plurality_claim_check())
 
         elif event == "NIGHT":
             if self._random_actions_task:
@@ -402,13 +612,24 @@ class MafiaBot:
             self._claimed_this_day = False
 
     def _build_question_prompt(self, session) -> Optional[str]:
-        from ..io.player_names import canonical_player_name
+        from ..io.player_names import names_match, player_identity_key
 
         alive_players = [p for p in session.players if p not in self.tracker.dead_players]
-        bot_clean = canonical_player_name(self.config.showdown.username)
-        valid_targets = [p for p in alive_players if canonical_player_name(p) != bot_clean]
+        valid_targets = [p for p in alive_players if not names_match(p, self.config.showdown.username)]
         if len(valid_targets) < 1:
             return None
+
+        current_vote_target = getattr(self, "_current_vote_target", None)
+        if current_vote_target:
+            # Occasionally rally someone else onto the bot's own vote instead
+            # of the usual read-fishing prompts. Excludes the vote target
+            # itself from being asked to "vote themselves with me".
+            rally_targets = [
+                p for p in valid_targets
+                if player_identity_key(p) != player_identity_key(current_vote_target)
+            ]
+            if rally_targets and random.random() < 0.2:
+                return f"{random.choice(rally_targets)} vote {current_vote_target} with me"
 
         prompt_groups = {
             1: [
@@ -419,17 +640,29 @@ class MafiaBot:
                 "{player1} im voting u in volo btw",
                 "{player1} pls read",
                 "{player1} get off",
+                "{player1} whats your read on the game rn",
+                "{player1} you've been quiet",
+                "{player1} thoughts?",
+                "{player1} who are you voting",
+                "{player1} defend yourself",
+                "{player1} why havent you voted yet",
+                "{player1} whats your case",
+                "{player1} elaborate on your reads",
             ],
             2: [
                 "{player1} what do you think about {player2}?",
                 "{player1} and {player2} what are your reads on each other?",
                 "{player1} if {player2} is scum who do you think their partner is?",
                 "{player1} what do you think of {player2}'s vote",
+                "{player1} would you rather vote {player2} or someone else",
+                "{player1} do you trust {player2}",
+                "{player1} and {player2} sus me a read",
             ],
             3: [
                 "{player1} {player2} and {player3} are the scumteam btw",
                 "{player1} do you think {player2} and {player3} are paired?",
                 "{player1} and {player2} what do u think of {player3}",
+                "{player1} {player2} {player3} who's the odd one out here",
             ],
         }
 
@@ -462,6 +695,11 @@ class MafiaBot:
         if self.config.showdown.username and names_match(sender, self.config.showdown.username):
             return
 
+        # System/room announcements (roster lists, phase changes, etc.)
+        # aren't something a "player" said -- don't parrot them as filler.
+        if sender == "~":
+            return
+
         if not message_text:
             return
         if message_text.lower().startswith("/mafia"):
@@ -479,33 +717,48 @@ class MafiaBot:
         """Periodically says filler chat, so the bot doesn't sit silent all day.
 
         Each message goes through _send_chat_message so it's paced like
-        someone actually typing it, rather than several lines firing at once.
+        someone actually typing it. Exactly one action (or none) is chosen
+        per cycle -- picking multiple independently used to let several
+        lines fire back-to-back in the same tick, then go quiet for a long
+        stretch until the next one; a single weighted choice spaces
+        individual lines out evenly over time instead.
+
+        In silent_mode this does nothing at all -- voting/claiming still
+        happen elsewhere, but the bot never volunteers unprompted chatter.
         """
-        filler_words = ["bruh", "hm", "oh", "welp", "bleh", "uhh", "thinking", "...", "interesting", "lol", "i mean"]
+        if self.config.gameplay.silent_mode:
+            return
+
+        filler_words = [
+            "bruh", "hm", "oh", "welp", "bleh", "uhh", "thinking", "...", "interesting", "lol", "i mean",
+            "fr", "ngl", "yikes", "damn", "wow", "smh", "lmao", "eh", "hmm ok", "wild",
+        ]
 
         while self.tracker.state == "DAY" and self.tracker.in_game and not self.tracker.eliminated:
             try:
-                await asyncio.sleep(random.uniform(45.0, 90.0))
+                await asyncio.sleep(random.uniform(35.0, 65.0))
                 if self.tracker.state != "DAY" or not self.tracker.in_game or self.tracker.eliminated:
                     break
 
-                word = random.choice(filler_words)
-                logger.info(f"Saying random filler word: {word}")
-                await self._send_chat_message(word)
+                options = ["filler", "question", "none"]
+                weights = [2, 3, 2]
+                if self._remembered_lines:
+                    options.insert(1, "reaction")
+                    weights.insert(1, 3)
 
-                if not self.tracker.in_game:
-                    logger.info("Bot is no longer in the game; stopping random actions loop.")
-                    break
+                action = random.choices(options, weights=weights, k=1)[0]
 
-                if self._remembered_lines and random.random() < 0.5:
+                if action == "filler":
+                    word = random.choice(filler_words)
+                    logger.info(f"Saying random filler word: {word}")
+                    await self._send_chat_message(word)
+                elif action == "reaction":
                     remembered_line = random.choice(self._remembered_lines)
-                    logger.info(f"Repeating remembered line: {remembered_line}")
-                    await self._send_chat_message(remembered_line)
-
-                if self.tracker.state != "DAY" or not self.tracker.in_game or self.tracker.eliminated:
-                    break
-
-                if random.random() < 0.5:
+                    reaction = random.choice(REACTION_PHRASES)
+                    quoted = f"{remembered_line} // {reaction}"
+                    logger.info(f"Reacting to remembered line: {quoted}")
+                    await self._send_chat_message(quoted)
+                elif action == "question":
                     session = self.tracker.get_game_session()
                     question_prompt = self._build_question_prompt(session)
                     if question_prompt:
@@ -527,7 +780,36 @@ class MafiaBot:
             logger.info("Running first vote evaluation of the day.")
             await self._evaluate_and_vote()
 
-    async def _evaluate_and_vote(self):
+    def _pick_random_vote_target(self, session) -> Optional[str]:
+        """Picks a random target for an unsure/exploratory vote.
+
+        The "alive" pool and the "randvote candidate" pool aren't the same
+        thing: a player the model currently reads as fairly confident town
+        (even if nobody cleared the bar to vote as a suspect) is excluded
+        from random guessing, rather than being an equally-likely target as
+        everyone else. Falls back to the full alive pool if that would
+        leave no candidates at all (e.g. in a tiny/short game where the
+        model has too little signal to read anyone as confidently town).
+        """
+        from ..io.player_names import names_match, player_identity_key
+
+        alive_players = [p for p in session.players if p not in self.tracker.dead_players]
+        valid_targets = [p for p in alive_players if not names_match(p, self.config.showdown.username)]
+        if not valid_targets:
+            return None
+
+        predictions = self._get_strategy_full_predictions(session)
+        town_read_keys = {
+            player_identity_key(name)
+            for name, prob_mafia in predictions
+            if (1.0 - prob_mafia) >= self.strategy.min_confidence
+        }
+        non_town_targets = [p for p in valid_targets if player_identity_key(p) not in town_read_keys]
+
+        pool = non_town_targets or valid_targets
+        return random.choice(pool)
+
+    async def _evaluate_and_vote(self, allow_random_fallback: bool = False):
         if self.tracker.state != "DAY" or self.tracker.eliminated:
             logger.info("Current tracker state is not DAY or bot is eliminated; skipping vote evaluation.")
             return
@@ -541,12 +823,28 @@ class MafiaBot:
             logger.info("Bot is not participating in the current game. Skipping vote evaluation.")
             return
 
-        target, confidence = self._get_strategy_vote(session)
+        volo_confidence = None
+        if self._is_volo(session):
+            volo_confidence = self.config.gameplay.volo_min_confidence
+            logger.info(f"VoLo detected; raising vote confidence bar to {volo_confidence}.")
+
+        target, confidence = self._get_strategy_vote(session, min_confidence=volo_confidence)
+        is_random_guess = False
+
+        if not target and allow_random_fallback:
+            # Last evaluation of the day and still no confident read -- take
+            # a random guess rather than sitting out the vote entirely.
+            target = self._pick_random_vote_target(session)
+            is_random_guess = target is not None
 
         if target:
             if target != self._current_vote_target:
-                logger.info(f"Decided to vote for {target} (confidence: {confidence:.2%}). Previous: {self._current_vote_target}")
-                await self._cast_vote_with_optional_comment(target)
+                if is_random_guess:
+                    logger.info(f"No confident read; randomly voting {target} at the last moment.")
+                    await self.send_room_command(f"/mafia vote {target}")
+                else:
+                    logger.info(f"Decided to vote for {target} (confidence: {confidence:.2%}). Previous: {self._current_vote_target}")
+                    await self._cast_vote_with_optional_comment(target)
                 self._current_vote_target = target
             else:
                 logger.info(f"Maintaining current vote on {target} (confidence: {confidence:.2%})")
@@ -560,7 +858,7 @@ class MafiaBot:
         if town_read:
             if town_read != self._current_town_read:
                 logger.info(f"Decided {town_read} is town (confidence: {town_confidence:.2%}). Previous: {self._current_town_read}")
-                if random.random() < self.config.gameplay.town_read_comment_chance:
+                if not self.config.gameplay.silent_mode and random.random() < self.config.gameplay.town_read_comment_chance:
                     await self._send_chat_message(f"{town_read} is town")
                 self._current_town_read = town_read
             else:
@@ -571,8 +869,11 @@ class MafiaBot:
     async def _cast_vote_with_optional_comment(self, target: str):
         """Casts a vote the way a person actually would: not always narrated,
         and when it is, not always glued to the vote in the same order.
+
+        In silent_mode the vote itself always still happens -- only the
+        narration is suppressed.
         """
-        if random.random() >= self.config.gameplay.vote_comment_chance:
+        if self.config.gameplay.silent_mode or random.random() >= self.config.gameplay.vote_comment_chance:
             await self.send_room_command(f"/mafia vote {target}")
             return
 
@@ -605,7 +906,19 @@ class MafiaBot:
         print("="*60 + "\n")
         
         loop = asyncio.get_running_loop()
-        choice = await loop.run_in_executor(None, input, "Store this game to database? [y/N]: ")
+        try:
+            choice = await loop.run_in_executor(None, input, "Store this game to database? [y/N]: ")
+        except EOFError:
+            # No interactive stdin (e.g. running headless/backgrounded) --
+            # there's no one to answer the prompt, so the game is discarded
+            # exactly as if "N" were answered. This is a real gap for
+            # unattended runs: every completed game's data is lost unless
+            # someone is at the terminal to confirm the save.
+            logger.warning(
+                "No interactive stdin available to confirm DB save (running unattended); "
+                "discarding this completed game instead of crashing."
+            )
+            return
         if choice.strip().lower() != 'y':
             logger.info("User chose not to save the game. Discarding.")
             return
@@ -713,10 +1026,17 @@ class MafiaBot:
             return
 
         if cmd == ".vote" and len(parts) > 1:
-            target = parts[1]
-            await self.send_room_command(f"/mafia vote {target}")
-            self._current_vote_target = target
-            await self.connection.send(f"|/pm {clean_sender}, Voted {target}.")
+            from ..io.player_names import player_identity_key
+
+            target_input = parts[1]
+            target_key = player_identity_key(target_input)
+            real_target = next((p for p in self.tracker.players if player_identity_key(p) == target_key), None)
+            if not real_target:
+                await self.connection.send(f"|/pm {clean_sender}, {target_input} is not a real player.")
+                return
+            await self.send_room_command(f"/mafia vote {real_target}")
+            self._current_vote_target = real_target
+            await self.connection.send(f"|/pm {clean_sender}, Voted {real_target}.")
 
         elif cmd == ".multiplier" and len(parts) > 2:
             target = parts[1]

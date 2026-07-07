@@ -17,10 +17,15 @@ def player_identity_key(name: str) -> str:
 
 
 def canonical_player_name(name: str) -> str:
-    """Store/display name using English letters and digits only."""
-    cleaned = normalize_player_name(name)
-    letters = re.sub(r"[^a-zA-Z0-9]", "", cleaned)
-    return letters if letters else cleaned
+    """Store/display name exactly as it appears (spaces, punctuation,
+    unicode and all) -- only a leading rank/prefix symbol and surrounding
+    whitespace are stripped. This has to match what's actually stored as a
+    player's raw name in the database, or the same person ends up filed
+    under two different spellings (e.g. "Lucid Daydream" vs
+    "LucidDaydream"). Use player_identity_key/names_match, not this, for
+    identity comparisons -- this is for storage/display only.
+    """
+    return normalize_player_name(name)
 
 
 def names_match(left: str, right: str) -> bool:

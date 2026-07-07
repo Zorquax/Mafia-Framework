@@ -26,10 +26,13 @@ class TestPlayerNames(unittest.TestCase):
         )
         session = parse_showdown_log(raw)
         self.assertEqual(len(session.players), 1)
-        self.assertEqual(session.players[0], "Schiavetto")
+        # The canonical form is now whichever raw variant was seen first in
+        # the roster (decorations and all), not a flattened/stripped name --
+        # it has to match what's actually stored as the player's raw name.
+        self.assertEqual(session.players[0], "Schiavetto ♫♪♫♪")
         self.assertEqual(len(session.messages), 2)
-        self.assertEqual(session.messages[0].player_name, "Schiavetto")
-        self.assertEqual(session.messages[1].player_name, "Schiavetto")
+        self.assertEqual(session.messages[0].player_name, "Schiavetto ♫♪♫♪")
+        self.assertEqual(session.messages[1].player_name, "Schiavetto ♫♪♫♪")
 
     def test_game_log_matches_fuzzy_player_names(self):
         session = parse_showdown_log(
