@@ -23,11 +23,17 @@ OWN_ROLE_PM_RE = re.compile(r"^(?P<name>.+?),\s*you\s+are\s+an?\s+(?P<role>.+?)\
 OWN_ROLE_BOX_RE = re.compile(r"Your\s+role\s+is:?\s*(?P<role>.+?)</div>", re.IGNORECASE)
 
 # Roles the bot should claim VT (Vanilla Townie) for instead of its real
-# role -- any Mafia-aligned role (e.g. "Mafia Goon"), plus specific
-# dangerous-to-reveal non-town roles from other alignments. "goo" alone
-# wouldn't match "Mafia Goon" (no word boundary between "goo" and "n"), but
-# that's covered by the "mafia" keyword now anyway.
-LIE_AS_VT_ROLE_RE = re.compile(r"\b(mafia|werewolf|alien|cult\w*|serial\s+killer|goo)\b", re.IGNORECASE)
+# role -- any Mafia-aligned role (e.g. "Mafia Goon"), any solo/neutral role
+# (this ruleset prefixes those with "Solo", e.g. "Solo Condemner"), plus
+# specific dangerous-to-reveal non-town roles from other alignments. "goo"
+# alone wouldn't match "Mafia Goon" (no word boundary between "goo" and
+# "n"), but that's covered by the "mafia" keyword now anyway. Unlike
+# scum/town roles, solo roles aren't reliably colour-coded in the room, so
+# there's no clean way to detect the whole category automatically -- these
+# have to be added by name as they come up.
+LIE_AS_VT_ROLE_RE = re.compile(
+    r"\b(mafia|werewolf|alien|cult\w*|serial\s+killer|goo|solo|condemner)\b", re.IGNORECASE
+)
 
 VALID_ALIGNMENTS = {"town", "mafia", "neutral", "unknown"}
 
@@ -695,6 +701,10 @@ class MafiaBot:
                 "{player1} why havent you voted yet",
                 "{player1} whats your case",
                 "{player1} elaborate on your reads",
+                "whats up {player1}",
+                "{player1} you good?",
+                "yo {player1}",
+                "{player1} sup",
             ],
             2: [
                 "{player1} what do you think about {player2}?",
@@ -761,14 +771,14 @@ class MafiaBot:
             self._remembered_lines = self._remembered_lines[-12:]
 
     async def _random_actions_loop(self):
-        """Periodically says filler chat, so the bot doesn't sit silent all day.
+        """Idle chatter for when nothing's happening, so the bot doesn't sit
+        completely silent all day -- but sparingly, roughly once every 10
+        minutes, not a running commentary. Each cycle either reacts to
+        something someone said or asks a random question, never both, and
+        often neither.
 
         Each message goes through _send_chat_message so it's paced like
-        someone actually typing it. Exactly one action (or none) is chosen
-        per cycle -- picking multiple independently used to let several
-        lines fire back-to-back in the same tick, then go quiet for a long
-        stretch until the next one; a single weighted choice spaces
-        individual lines out evenly over time instead.
+        someone actually typing it.
 
         In silent_mode this does nothing at all -- voting/claiming still
         happen elsewhere, but the bot never volunteers unprompted chatter.
@@ -776,30 +786,21 @@ class MafiaBot:
         if self.config.gameplay.silent_mode:
             return
 
-        filler_words = [
-            "bruh", "hm", "oh", "welp", "bleh", "uhh", "thinking", "...", "interesting", "lol", "i mean",
-            "fr", "ngl", "yikes", "damn", "wow", "smh", "lmao", "eh", "hmm ok", "wild",
-        ]
-
         while self.tracker.state == "DAY" and self.tracker.in_game and not self.tracker.eliminated:
             try:
-                await asyncio.sleep(random.uniform(35.0, 65.0))
+                await asyncio.sleep(random.uniform(480.0, 720.0))
                 if self.tracker.state != "DAY" or not self.tracker.in_game or self.tracker.eliminated:
                     break
 
-                options = ["filler", "question", "none"]
-                weights = [2, 3, 2]
+                options = ["question", "none"]
+                weights = [3, 2]
                 if self._remembered_lines:
-                    options.insert(1, "reaction")
-                    weights.insert(1, 3)
+                    options.insert(0, "reaction")
+                    weights.insert(0, 3)
 
                 action = random.choices(options, weights=weights, k=1)[0]
 
-                if action == "filler":
-                    word = random.choice(filler_words)
-                    logger.info(f"Saying random filler word: {word}")
-                    await self._send_chat_message(word)
-                elif action == "reaction":
+                if action == "reaction":
                     remembered_line = random.choice(self._remembered_lines)
                     reaction = random.choice(REACTION_PHRASES)
                     quoted = f"{remembered_line} // {reaction}"
@@ -1043,6 +1044,7 @@ class MafiaBot:
         # Command parsing (uses a "." prefix, not "!" -- "!" is reserved for
         # staff broadcast commands on Showdown and gets intercepted):
         # .vote [player] -> cast a vote for player right now (one-time action)
+        # .unvote -> clear the bot's current vote, if it has one
         # .multiplier [player] [value] -> suspicion multiplier
         # .reset -> clear suspicion multipliers
         # .reads -> full ranked mafia-probability list for every live player
@@ -1067,15 +1069,34 @@ class MafiaBot:
             return
 
         if cmd == ".reads":
+            # session.players can include someone who was added mid-game and
+            # later left/was removed by the host through wording we don't
+            # have a regex for (e.g. "X has been added to the game by Y",
+            # or simply disconnecting) -- rather than trying to special-case
+            # every possible add/remove phrasing, cross-check against the
+            # room's own live vote-roster (refreshed right before replying),
+            # which reflects who can actually still be voted on right now.
+            await self.send_room_command("/mafia votes")
+            await asyncio.sleep(1.5)
+
             session = self.tracker.get_game_session()
             predictions = self._get_strategy_full_predictions(session)
+            live_counts = getattr(self.tracker, "live_vote_counts", None)
+            if live_counts:
+                from ..io.player_names import player_identity_key
+                live_keys = {player_identity_key(name) for name in live_counts}
+                predictions = [(name, prob) for name, prob in predictions if player_identity_key(name) in live_keys]
+
             await self.connection.send(f"|/pm {clean_sender}, {self._format_reads_message(predictions)}")
             return
 
         if cmd == ".vote" and len(parts) > 1:
             from ..io.player_names import player_identity_key
 
-            target_input = parts[1]
+            # Player names can contain spaces (e.g. "I give u pile alt") --
+            # take everything after the command itself, not just the first
+            # whitespace-delimited token, or a multi-word name never matches.
+            target_input = " ".join(parts[1:])
             target_key = player_identity_key(target_input)
             real_target = next((p for p in self.tracker.players if player_identity_key(p) == target_key), None)
             if not real_target:
@@ -1084,6 +1105,15 @@ class MafiaBot:
             await self.send_room_command(f"/mafia vote {real_target}")
             self._current_vote_target = real_target
             await self.connection.send(f"|/pm {clean_sender}, Voted {real_target}.")
+
+        if cmd == ".unvote":
+            if not self._current_vote_target:
+                await self.connection.send(f"|/pm {clean_sender}, not voting anyone")
+                return
+            await self.send_room_command("/mafia unvote")
+            self._current_vote_target = None
+            await self.connection.send(f"|/pm {clean_sender}, Unvoted.")
+            return
 
         elif cmd == ".multiplier" and len(parts) > 2:
             target = parts[1]

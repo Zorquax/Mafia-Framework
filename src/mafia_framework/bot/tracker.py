@@ -198,6 +198,15 @@ class GameTracker:
             return "SIGNUPS"
 
         if GAME_ENDED_RE.search(clean_text):
+            if self.state == "IDLE":
+                # Already handled -- the room can send more than one
+                # "game has ended"-shaped message for the same finish (e.g.
+                # a win announcement followed by a separate wrap-up
+                # message), and this check runs unconditionally on every
+                # message. Without this guard each one re-fired FINISHED,
+                # causing "gg" and the ragebait line to send multiple times
+                # for a single game.
+                return None
             self.state = "IDLE"
             self.in_game = False
             self.eliminated = False
@@ -245,7 +254,15 @@ class GameTracker:
                     self.accumulated_lines.append(line)
                     return None
                 self.players = parsed_players
-                self.state = "DAY"
+                # Roster lock doesn't mean Day 1 has actually begun -- there's
+                # a rolling/role-distribution period (often shown as "Night
+                # 0") before the real "Day 1. The hammer count is set at..."
+                # marker arrives. Treating that gap as already "DAY" made the
+                # bot start chatting (filler, reactions, questions) before
+                # the game had actually started. NIGHT is a closer fit --
+                # nothing here talks during NIGHT -- and the real DAY_MARKER_RE
+                # match below flips it to DAY for real once Day 1 starts.
+                self.state = "NIGHT"
                 self.accumulated_lines.append(line)
                 self.in_game = self._is_bot_on_roster(bot_username)
                 self.eliminated = False

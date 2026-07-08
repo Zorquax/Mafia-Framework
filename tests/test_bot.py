@@ -64,9 +64,11 @@ class TestBotComponents(unittest.TestCase):
         self.assertEqual(tracker.state, "SIGNUPS")
         self.assertEqual(event, "SIGNUPS")
 
-        # 2. Game start / roster announcement
+        # 2. Game start / roster announcement -- this is the rolling/role-
+        # distribution period, not Day 1 yet, so state goes to NIGHT (no
+        # chatting) until the real Day 1 marker arrives.
         event = tracker.process_message("|c:|1779642701|~|**Players (3)**: Alice, Bob, Charlie")
-        self.assertEqual(tracker.state, "DAY")
+        self.assertEqual(tracker.state, "NIGHT")
         self.assertEqual(event, "STARTED")
         self.assertEqual(tracker.players, ["Alice", "Bob", "Charlie"])
 
@@ -562,7 +564,7 @@ class TestBotComponents(unittest.TestCase):
         bot._send_chat_message = AsyncMock(side_effect=stop_after_one_message)
 
         with patch("mafia_framework.bot.client.asyncio.sleep", new=AsyncMock()), \
-             patch("random.choices", return_value=["filler"]):
+             patch("random.choices", return_value=["reaction"]):
             asyncio.run(bot._random_actions_loop())
 
         bot._send_chat_message.assert_awaited_once()
@@ -822,6 +824,7 @@ class TestBotComponents(unittest.TestCase):
         for role in [
             "Werewolf", "Alien", "Cult Leader", "Serial Killer", "Goo",
             "Mafia Goon", "Mafia Roleblocker", "Mafia Boss",
+            "Solo Condemner", "Solo Traitor Lover Vigilante One-Shot Strongman", "Condemner",
         ]:
             bot._own_role = role
             self.assertEqual(bot._get_claim_message(), "Vanilla Townie", msg=f"role={role}")
@@ -965,8 +968,39 @@ class TestBotComponents(unittest.TestCase):
         bot.strategy.get_full_predictions = Mock(return_value=[("Bob", 0.82), ("Alice", 0.20)])
         bot.connection = Mock()
         bot.connection.send = AsyncMock()
+        bot.send_room_command = AsyncMock()
 
-        asyncio.run(bot._handle_pm("Host", ".reads"))
+        with patch("mafia_framework.bot.client.asyncio.sleep", new=AsyncMock()):
+            asyncio.run(bot._handle_pm("Host", ".reads"))
+
+        bot.send_room_command.assert_awaited_once_with("/mafia votes")
+        bot.connection.send.assert_awaited_once_with("|/pm Host, Bob 82% | Alice 20%")
+
+    def test_handle_pm_reads_command_excludes_players_no_longer_in_live_votes(self):
+        # A player added mid-game and later removed/left through wording we
+        # don't have a regex for can linger in session.players -- cross-
+        # checking against the live vote-roster filters them back out.
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob", "Departed"])
+        bot.tracker = SimpleNamespace(
+            in_game=True, eliminated=False, players=["Alice", "Bob", "Departed"], dead_players=set(),
+            get_game_session=Mock(return_value=session),
+            live_vote_counts={"Alice": 0, "Bob": 0},
+        )
+        bot.config = SimpleNamespace(
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+        )
+        bot.strategy = Mock()
+        bot.strategy.get_full_predictions = Mock(
+            return_value=[("Bob", 0.82), ("Departed", 0.55), ("Alice", 0.20)]
+        )
+        bot.connection = Mock()
+        bot.connection.send = AsyncMock()
+        bot.send_room_command = AsyncMock()
+
+        with patch("mafia_framework.bot.client.asyncio.sleep", new=AsyncMock()):
+            asyncio.run(bot._handle_pm("Host", ".reads"))
 
         bot.connection.send.assert_awaited_once_with("|/pm Host, Bob 82% | Alice 20%")
 
@@ -1000,6 +1034,54 @@ class TestBotComponents(unittest.TestCase):
 
         bot.connection.send.assert_awaited_once_with("|/pm Host, pomegrenato is not a real player.")
         self.assertIsNone(bot._current_vote_target)
+
+    def test_handle_pm_vote_command_handles_multi_word_player_names(self):
+        # Real names can contain spaces (e.g. "I give u pile alt") -- only
+        # grabbing the first whitespace-delimited token after ".vote" would
+        # try to match just "I" and fail to find a real player.
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(
+            in_game=True, eliminated=False, players=["I give u pile alt", "Bob"], dead_players=set()
+        )
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot.connection = Mock()
+        bot.connection.room = "mafia"
+        bot.connection.send = AsyncMock()
+        bot._current_vote_target = None
+
+        asyncio.run(bot._handle_pm("Host", ".vote I give u pile alt"))
+
+        bot.connection.send.assert_any_call("mafia|/mafia vote I give u pile alt")
+        bot.connection.send.assert_any_call("|/pm Host, Voted I give u pile alt.")
+        self.assertEqual(bot._current_vote_target, "I give u pile alt")
+
+    def test_handle_pm_unvote_command_clears_current_vote(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(in_game=True, eliminated=False, players=["Alice", "Bob"], dead_players=set())
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot.connection = Mock()
+        bot.connection.room = "mafia"
+        bot.connection.send = AsyncMock()
+        bot._current_vote_target = "Alice"
+
+        asyncio.run(bot._handle_pm("Host", ".unvote"))
+
+        bot.connection.send.assert_any_call("mafia|/mafia unvote")
+        bot.connection.send.assert_any_call("|/pm Host, Unvoted.")
+        self.assertIsNone(bot._current_vote_target)
+
+    def test_handle_pm_unvote_command_when_not_voting_anyone(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(in_game=True, eliminated=False, players=["Alice", "Bob"], dead_players=set())
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot.connection = Mock()
+        bot.connection.room = "mafia"
+        bot.connection.send = AsyncMock()
+        bot._current_vote_target = None
+
+        asyncio.run(bot._handle_pm("Host", ".unvote"))
+
+        bot.connection.send.assert_awaited_once_with("|/pm Host, not voting anyone")
 
     def test_delayed_first_evaluation_waits_configured_seconds(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -1082,10 +1164,17 @@ class TestBotComponents(unittest.TestCase):
         bot._current_vote_target = None
         session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
 
-        with patch("random.random", return_value=0.0), patch("random.choices", return_value=[1]), patch("random.sample", side_effect=lambda items, k: items[:k]):
+        # Pin the template choice to one that doesn't happen to contain
+        # "with me" itself (e.g. the normal "Vote with me plz" template) --
+        # otherwise this assertion would be a flaky false-positive on the
+        # real random.choice rather than actually verifying the rally
+        # branch (gated on current_vote_target) was never reached.
+        with patch("random.random", return_value=0.0), patch("random.choices", return_value=[1]), \
+             patch("random.sample", side_effect=lambda items, k: items[:k]), \
+             patch("random.choice", side_effect=lambda seq: next(t for t in seq if "give me reads" in t)):
             prompt = bot._build_question_prompt(session)
 
-        self.assertNotIn("with me", prompt)
+        self.assertEqual(prompt, "Alice give me reads")
 
     def test_started_event_clears_remembered_lines(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -1183,6 +1272,27 @@ class TestBotComponents(unittest.TestCase):
         self.assertEqual(tracker.players, ["Alice", "BotUser"])
         self.assertTrue(tracker.in_game)
 
+    def test_duplicate_game_end_message_does_not_refire_finished(self):
+        # Seen live: the room can send more than one "game has ended"-shaped
+        # message for the same finish (e.g. a win announcement followed by
+        # a separate wrap-up message), which used to re-fire FINISHED each
+        # time -- causing "gg" and the ragebait line to send multiple times
+        # for a single game end.
+        tracker = GameTracker()
+        tracker.state = "DAY"
+        tracker.players = ["Alice", "BotUser"]
+        tracker.in_game = True
+
+        first_event = tracker.process_message(
+            "|c:|123|~|The game of Mafia has ended.", bot_username="BotUser"
+        )
+        self.assertEqual(first_event, "FINISHED")
+
+        second_event = tracker.process_message(
+            "|c:|124|~|The game of Mafia has ended.", bot_username="BotUser"
+        )
+        self.assertIsNone(second_event)
+
     def test_spectate_broadcast_does_not_override_confirmed_in_game(self):
         # Seen live: this "in progress / become a substitute / spectate"
         # broadcast is sent generically to anyone joining/refreshing the
@@ -1223,6 +1333,26 @@ class TestBotComponents(unittest.TestCase):
 
         self.assertIsNone(event)
         self.assertFalse(tracker.in_game)
+
+    def test_roster_lock_does_not_immediately_count_as_day(self):
+        # Seen live: roster lock is followed by a rolling/role-distribution
+        # period ("Night 0") before Day 1 actually starts. Treating the
+        # roster announcement as already-DAY made the bot start chatting
+        # (filler/reactions/questions, all gated on state == "DAY") before
+        # the game itself had really started.
+        tracker = GameTracker()
+
+        event = tracker.process_message(
+            "|c:|123|~|**Players (3)**: Alice, Bob, BotUser", bot_username="BotUser"
+        )
+        self.assertEqual(event, "STARTED")
+        self.assertNotEqual(tracker.state, "DAY")
+
+        day_event = tracker.process_message(
+            "Day 1. The hammer count is set at 2", bot_username="BotUser"
+        )
+        self.assertEqual(day_event, "DAY")
+        self.assertEqual(tracker.state, "DAY")
 
     def test_hammer_count_parsed_from_day_marker(self):
         tracker = GameTracker()
