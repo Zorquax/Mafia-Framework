@@ -302,10 +302,20 @@ class GameTracker:
             # Check for day marker
             day_match = DAY_MARKER_RE.search(clean_text)
             if day_match:
-                self.state = "DAY"
                 day_text = day_match.group("day")
-                if day_text:
-                    self.current_day = int(day_text)
+                new_day = int(day_text) if day_text else self.current_day
+                if self.state == "DAY" and new_day == self.current_day:
+                    # DAY_MARKER_RE also matches generic decorative
+                    # separators (---, ***, etc.) with no requirement to
+                    # actually say "day"/"hammer", so an unrelated system
+                    # message (e.g. a reveal announcement that happens to
+                    # include a divider) can accidentally match this and
+                    # re-fire an already-active day, cascading into
+                    # redundant vote re-evaluations and duplicated
+                    # random-actions tasks.
+                    return None
+                self.state = "DAY"
+                self.current_day = new_day
                 hammer_match = HAMMER_COUNT_RE.search(clean_text)
                 if hammer_match:
                     self.hammer_count = int(hammer_match.group("hammer"))

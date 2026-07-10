@@ -143,6 +143,37 @@ class MafiaBot:
         return voter or None
 
     @staticmethod
+    def _extract_me_action(line: str, bot_username: str) -> Optional[str]:
+        """Returns the action text from someone else's "/ME ..." line (""
+        for a bare "/ME"), or None if this isn't a /ME line or it came from
+        the bot itself.
+
+        Deliberately case-sensitive and caps-only: "/ME" is a distinct,
+        louder style from the ordinary lowercase "/me" roleplay command,
+        and only the all-caps one should get mirrored back.
+        """
+        from ..io.player_names import names_match
+
+        parts = line.split("|")
+        if len(parts) > 3 and parts[1] == "c:":
+            sender = parts[3]
+            message_text = "|".join(parts[4:])
+        elif len(parts) > 2 and parts[1] == "c":
+            sender = parts[2]
+            message_text = "|".join(parts[3:])
+        else:
+            return None
+
+        if names_match(sender, bot_username):
+            return None
+
+        message_text = message_text.strip()
+        if not re.match(r"^/ME\b", message_text):
+            return None
+
+        return message_text[len("/ME"):].strip()
+
+    @staticmethod
     def _parse_own_role_box(line: str) -> Optional[str]:
         """Parses the private "/mafia role" query response, e.g.
         |c|~|/raw <div class="infobox">Your role is: Mafia Goon</div>
@@ -180,14 +211,6 @@ class MafiaBot:
         if not predictions:
             return "no reads available"
         return " | ".join(f"{name} {prob:.0%}" for name, prob in predictions)
-
-    def _get_bot_alignment(self, session) -> Optional[str]:
-        from ..io.player_names import names_match
-
-        for flip in session.flips:
-            if names_match(flip.player_name, self.config.showdown.username):
-                return flip.alignment.lower().strip() or None
-        return None
 
     def _get_random_live_player(self) -> Optional[str]:
         from ..io.player_names import names_match
@@ -404,10 +427,15 @@ class MafiaBot:
         return 2 * mafia_alive >= alive_total - 1
 
     def _choose_night_action_target(self, session) -> Optional[str]:
+        """Picks a random non-self kill target for the bot's own night
+        action, if its role is Mafia-aligned. Determined from the actual
+        role text learned live via /mafia role -- not from flips, which are
+        only populated after the bot has already died, too late to matter
+        for a night action while it's actually alive and playing.
+        """
         from ..io.player_names import names_match
 
-        alignment = self._get_bot_alignment(session)
-        if not alignment or alignment in {"town", "unknown"}:
+        if not self._own_role or not re.search(r"\bmafia\b", self._own_role, re.IGNORECASE):
             return None
 
         alive_players = [p for p in session.players if p not in self.tracker.dead_players]
@@ -504,6 +532,13 @@ class MafiaBot:
                     if event == "SIGNUPS" and self.config.gameplay.autojoin:
                         logger.info("Autojoining Mafia game from live room update...")
                         await self.send_room_command("/mafia join")
+
+                    if not self.config.gameplay.silent_mode:
+                        me_action = self._extract_me_action(line, self.config.showdown.username)
+                        if me_action is not None:
+                            mirrored = f"/ME {me_action}" if me_action else "/ME"
+                            logger.info(f"Mirroring /ME action: {mirrored}")
+                            await self.send_room_command(mirrored)
 
                     if (
                         not self.config.gameplay.silent_mode
@@ -624,8 +659,8 @@ class MafiaBot:
             if self.tracker.in_game:
                 target = self._choose_night_action_target(session)
                 if target:
-                    logger.info(f"Night action: targeting {target} with random non-self action.")
-                    await self.send_room_command(f"/mafia action {target}")
+                    logger.info(f"Night action: targeting {target} with a random kill.")
+                    await self.send_room_command(f"/mafia action kill {target}")
                 elif self.config.gameplay.night_idle:
                     logger.info("Night started. Sending night idle action.")
                     await self.send_room_command("/mafia idle")
@@ -958,15 +993,20 @@ class MafiaBot:
             choice = await loop.run_in_executor(None, input, "Store this game to database? [y/N]: ")
         except EOFError:
             # No interactive stdin (e.g. running headless/backgrounded) --
-            # there's no one to answer the prompt, so the game is discarded
-            # exactly as if "N" were answered. This is a real gap for
-            # unattended runs: every completed game's data is lost unless
-            # someone is at the terminal to confirm the save.
-            logger.warning(
-                "No interactive stdin available to confirm DB save (running unattended); "
-                "discarding this completed game instead of crashing."
-            )
-            return
+            # there's no one to answer the prompt. auto_save_games decides
+            # what happens then: save automatically (the point of running
+            # unattended live tests is to actually grow the training set),
+            # or discard, matching the old behavior, if curation matters
+            # more than capturing every run.
+            if self.config.gameplay.auto_save_games:
+                logger.info("No interactive stdin available; auto-saving this completed game.")
+                choice = "y"
+            else:
+                logger.warning(
+                    "No interactive stdin available to confirm DB save, and auto_save_games is "
+                    "off; discarding this completed game."
+                )
+                return
         if choice.strip().lower() != 'y':
             logger.info("User chose not to save the game. Discarding.")
             return
@@ -1004,7 +1044,18 @@ class MafiaBot:
             if row.is_inferred_town_candidate:
                 hint += ", inferred town"
             prompt = f"  Role for {row.player_name} ({hint}) [town/mafia/neutral/unknown, blank=skip]: "
-            answer = (await loop.run_in_executor(None, input, prompt)).strip().lower()
+            try:
+                answer = (await loop.run_in_executor(None, input, prompt)).strip().lower()
+            except EOFError:
+                # No interactive stdin -- the game itself is already saved
+                # by this point, so just leave the remaining players
+                # undefined (same as a blank/skipped answer) instead of
+                # letting this look like the whole save failed.
+                logger.info(
+                    f"No interactive stdin available; leaving {row.player_name} (and any "
+                    "remaining undefined players) unassigned."
+                )
+                return
             if not answer:
                 continue
             if answer not in VALID_ALIGNMENTS:
@@ -1098,6 +1149,16 @@ class MafiaBot:
             # whitespace-delimited token, or a multi-word name never matches.
             target_input = " ".join(parts[1:])
             target_key = player_identity_key(target_input)
+
+            # "No Vote" is a real, always-available room option (its own
+            # button in the votes list) -- not a player, so it would never
+            # match against self.tracker.players.
+            if target_key == "novote":
+                await self.send_room_command("/mafia vote novote")
+                self._current_vote_target = None
+                await self.connection.send(f"|/pm {clean_sender}, Voted No Vote.")
+                return
+
             real_target = next((p for p in self.tracker.players if player_identity_key(p) == target_key), None)
             if not real_target:
                 await self.connection.send(f"|/pm {clean_sender}, {target_input} is not a real player.")

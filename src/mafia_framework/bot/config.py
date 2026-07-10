@@ -41,6 +41,7 @@ class GameplayConfig:
     plurality_claim_check_seconds: list[float] = field(default_factory=lambda: [30.0, 20.0, 10.0, 5.0])
     volo_min_confidence: float = 0.75
     silent_mode: bool = False
+    auto_save_games: bool = True
 
 
 @dataclass
@@ -95,6 +96,7 @@ class BotConfig:
                 ],
                 volo_min_confidence=float(gameplay_data.get("volo_min_confidence", 0.75)),
                 silent_mode=bool(gameplay_data.get("silent_mode", False)),
+                auto_save_games=bool(gameplay_data.get("auto_save_games", True)),
             ),
             database=DatabaseConfig(
                 db_path=str(resolve_repo_path(database_data.get("db_path", "data/mafia.db"))),

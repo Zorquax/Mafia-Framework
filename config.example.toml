@@ -16,6 +16,7 @@ first_evaluation_delay_seconds = 60.0
 plurality_claim_check_seconds = [30.0, 20.0, 10.0, 5.0]
 volo_min_confidence = 0.75
 silent_mode = false
+auto_save_games = true
 
 [database]
 db_path = "data/mafia.db"
