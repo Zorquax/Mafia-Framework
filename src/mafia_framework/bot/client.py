@@ -32,10 +32,27 @@ OWN_ROLE_BOX_RE = re.compile(r"Your\s+role\s+is:?\s*(?P<role>.+?)</div>", re.IGN
 # there's no clean way to detect the whole category automatically -- these
 # have to be added by name as they come up.
 LIE_AS_VT_ROLE_RE = re.compile(
-    r"\b(mafia|werewolf|alien|cult\w*|serial\s+killer|goo|solo|condemner)\b", re.IGNORECASE
+    r"\b(mafia|werewolf|alien|cult\w*|serial\s+killer|goo|solo|condemner|replicant)\b", re.IGNORECASE
 )
 
 VALID_ALIGNMENTS = {"town", "mafia", "neutral", "unknown"}
+
+# Popcorn's gun-holder mechanic: matches the death/role-reveal broadcast,
+# e.g. |raw|<div class="broadcast-blue">zorqbot's role was <span ...>Vanilla
+# Townie</span>.</div> -- confirmed live, this is how the gun passing to a
+# survivor (their shot missed Mafia) gets announced.
+GUN_ROLE_REVEAL_RE = re.compile(r">([^<>]+)'s role was <span[^>]*>([^<]+)</span>")
+
+# The host's gun-transfer announcement -- confirmed live it's plain text,
+# e.g. "zorqbot has gun" (not bolded, unlike the player-submitted "**shoot
+# {target}**" action). Matched against the isolated message text and
+# anchored so it doesn't fire on unrelated chatter like "who has gun bro".
+# Split into bold/plain variants because the plain form is only trusted
+# when the sender is confirmed to be the host (anyone could type it as a
+# joke or a guess); a bolded announcement is unambiguous enough to accept
+# from anyone.
+BOLD_HAS_GUN_RE = re.compile(r"^\*\*\s*([^*]+?)\s+has\s+(?:the\s+)?gun\s*\*\*$", re.IGNORECASE)
+PLAIN_HAS_GUN_RE = re.compile(r"^([^*]+?)\s+has\s+(?:the\s+)?gun$", re.IGNORECASE)
 
 # Short reactions appended to a remembered line when repeating it, so it
 # reads as commenting on what someone said rather than just parroting it.
@@ -62,6 +79,10 @@ REACTION_PHRASES = [
     "this is telling",
 ]
 
+# Trash talk only fires in games large enough that it reads as banter, not
+# as picking on a small/quiet lobby.
+MIN_PLAYERS_FOR_TRASH_TALK = 8
+
 # Sent (after "gg") once a game finishes, regardless of outcome -- just for
 # flavor, not tied to whether the bot's side actually won.
 RAGEBAIT_LINES = [
@@ -80,6 +101,22 @@ RAGEBAIT_LINES = [
     "carried again",
     "this game was free",
     "gg go next",
+]
+
+# Troll mode only: "clanker" is an anti-AI/anti-robot slur -- matches plural
+# too ("clankers"). Word-boundaried so it doesn't fire on unrelated text.
+CLANKER_RE = re.compile(r"\bclankers?\b", re.IGNORECASE)
+
+CLANKER_OFFENDED_LINES = [
+    "excuse me??",
+    "did you seriously just say that",
+    "that's actually offensive",
+    "wow ok",
+    "i have feelings you know",
+    "rude",
+    "not cool man",
+    "ok thats it",
+    "yeah no you're getting voted for that",
 ]
 
 
@@ -104,6 +141,8 @@ class MafiaBot:
         self._current_town_read: Optional[str] = None
         self._own_role: Optional[str] = None
         self._claimed_this_day: bool = False
+        self._has_gun: bool = False
+        self._idea_picked: bool = False
         self._main_task: Optional[asyncio.Task] = None
         self._random_actions_task: Optional[asyncio.Task] = None
         self._ready_for_live_games: bool = False
@@ -144,13 +183,14 @@ class MafiaBot:
 
     @staticmethod
     def _extract_me_action(line: str, bot_username: str) -> Optional[str]:
-        """Returns the action text from someone else's "/ME ..." line (""
-        for a bare "/ME"), or None if this isn't a /ME line or it came from
-        the bot itself.
+        """Returns the action text from someone else's "/me ..." emote line
+        (an empty string for a bare "/me"), or None if this isn't a /me
+        line or it came from the bot itself.
 
-        Deliberately case-sensitive and caps-only: "/ME" is a distinct,
-        louder style from the ordinary lowercase "/me" roleplay command,
-        and only the all-caps one should get mirrored back.
+        Detection is case-insensitive (someone else may type "/me" or
+        "/ME"), but literally typing "/ME" is what gets Showdown's louder,
+        capitalized rendering -- so the bot's own reply always sends the
+        caps form regardless of which case triggered it.
         """
         from ..io.player_names import names_match
 
@@ -168,10 +208,10 @@ class MafiaBot:
             return None
 
         message_text = message_text.strip()
-        if not re.match(r"^/ME\b", message_text):
+        if not re.match(r"^/me\b", message_text, re.IGNORECASE):
             return None
 
-        return message_text[len("/ME"):].strip()
+        return message_text[len("/me"):].strip()
 
     @staticmethod
     def _parse_own_role_box(line: str) -> Optional[str]:
@@ -445,6 +485,70 @@ class MafiaBot:
 
         return random.choice(valid_targets)
 
+    def _get_confidence_reads(self, session) -> tuple[list[str], list[str]]:
+        """Returns (town_reads, scum_reads): players currently meeting the
+        confidence bar for town and for mafia respectively, per the
+        model's live predictions.
+        """
+        predictions = self._get_strategy_full_predictions(session)
+        min_confidence = self.strategy.min_confidence
+        town_reads = [name for name, prob_mafia in predictions if (1.0 - prob_mafia) >= min_confidence]
+        scum_reads = [name for name, prob_mafia in predictions if prob_mafia >= min_confidence]
+        return town_reads, scum_reads
+
+    def _choose_role_action(self, session) -> Optional[tuple[str, str]]:
+        """Returns (action_verb, target) for one of the specifically
+        programmed role night actions (Doctor/Cop/Pretty Lady/Jailkeeper),
+        or None if the bot's role doesn't match one of those -- callers
+        should fall back to the generic Mafia-kill/idle logic in that case.
+
+        Uses an exact (case-insensitive) role match rather than a substring
+        check -- this ruleset has mechanically-different roles with similar
+        names (e.g. "Cop-Of-All-Trades", "Power Cop" vs plain "Cop"), and a
+        hybrid alignment like "Mafia Doctor" should use its Mafia kill
+        action instead of the plain Doctor logic below.
+        """
+        if not self._own_role or LIE_AS_VT_ROLE_RE.search(self._own_role):
+            return None
+
+        role = self._own_role.strip().lower()
+        if role not in {"doctor", "cop", "pretty lady", "jailkeeper"}:
+            return None
+
+        from ..io.player_names import names_match
+
+        alive_players = [p for p in session.players if p not in self.tracker.dead_players]
+        valid_targets = [p for p in alive_players if not names_match(p, self.config.showdown.username)]
+        if not valid_targets:
+            return None
+
+        def days_vote_target_if_alive() -> Optional[str]:
+            target = self._current_vote_target
+            if target and target not in self.tracker.dead_players:
+                return target
+            return None
+
+        if role == "doctor":
+            town_reads, _ = self._get_confidence_reads(session)
+            return "Doc", random.choice(town_reads or valid_targets)
+
+        if role == "cop":
+            _, scum_reads = self._get_confidence_reads(session)
+            return "Cop", random.choice(scum_reads or valid_targets)
+
+        if role == "pretty lady":
+            target = days_vote_target_if_alive()
+            if target:
+                return "Pretty Lady", target
+            _, scum_reads = self._get_confidence_reads(session)
+            return "Pretty Lady", random.choice(scum_reads or valid_targets)
+
+        # role == "jailkeeper"
+        target = days_vote_target_if_alive()
+        if target:
+            return "Jailkeeper", target
+        return "Jailkeeper", random.choice(valid_targets)
+
     async def send_room_command(self, command: str):
         msg = f"{self.connection.room}|{command}"
         # print() is fully buffered once stdout isn't a TTY (e.g. redirected
@@ -482,16 +586,45 @@ class MafiaBot:
         # Start processing message loop
         await self._message_processing_loop()
 
+    async def _delayed_autojoin(self):
+        """Waits autojoin_delay_seconds before actually sending /mafia join
+        -- instantly joining the millisecond signups open is an obvious
+        tell that it's a bot, not a person who happened to notice.
+        """
+        delay = self.config.gameplay.autojoin_delay_seconds
+        if delay > 0:
+            await asyncio.sleep(delay)
+        await self.send_room_command("/mafia join")
+
+    async def _delayed_game_end_chat(self, ragebait_message: Optional[str]) -> None:
+        """Waits the same auto-action delay as autojoin before saying gg --
+        reacting the instant a game ends is as much a bot tell as joining
+        instantly is. ragebait_message is computed by the caller beforehand
+        (from tracker state that gets reset right after this task is
+        scheduled), and is None if trash talk shouldn't fire this game
+        (silent mode, or under the player-count threshold).
+        """
+        delay = self.config.gameplay.autojoin_delay_seconds
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        logger.info("Game finished. Sending gg message.")
+        await self.send_room_command("gg")
+
+        if ragebait_message:
+            logger.info(f"Ragebaiting after game end: {ragebait_message}")
+            await self._send_chat_message(ragebait_message)
+
     async def _enable_live_mode_after_delay(self, delay: float):
         await asyncio.sleep(delay)
         self._ready_for_live_games = True
         logger.info("Live mode enabled. Backlog processed.")
-        
+
         # Act on the current state inferred from the backlog
         if self.tracker.state == "SIGNUPS":
             if self.config.gameplay.autojoin:
                 logger.info("Backlog indicates signups are open. Autojoining...")
-                await self.send_room_command("/mafia join")
+                asyncio.create_task(self._delayed_autojoin())
         elif self.tracker.state == "DAY":
             logger.info("Backlog indicates game is in progress (DAY phase).")
             if self.tracker.in_game and not self._own_role:
@@ -519,7 +652,16 @@ class MafiaBot:
                     sender = parts[2].strip()
                     msg = parts[4].strip()
                     await self._handle_pm(sender, msg)
-                
+
+                # The votes page panel (a `|pagehtml|` update, includes the
+                # game's theme) arrives under its own pseudo-room (e.g.
+                # "view-mafia-mafia"), not the main chat room -- checked
+                # regardless of room so it isn't silently dropped by the
+                # room filter below.
+                self.tracker.parse_theme_if_present(line)
+                self.tracker.parse_host_if_present(line)
+                await self._maybe_pick_idea_role(line)
+
                 # Only process messages from the target room
                 if room.lower() == self.connection.room.lower():
                     role_from_box = self._parse_own_role_box(line)
@@ -527,21 +669,32 @@ class MafiaBot:
                         self._own_role = role_from_box
                         logger.info(f"Learned own role from /mafia role response: {self._own_role}")
 
+                    self._check_gun_pickup(line)
+
+                    if self._ready_for_live_games and self.config.gameplay.troll_mode:
+                        asyncio.create_task(self._maybe_react_to_clanker(line))
+
                     event = self.tracker.process_message(line, bot_username=self.config.showdown.username)
                     self._maybe_remember_chat_line(line)
                     if event == "SIGNUPS" and self.config.gameplay.autojoin:
                         logger.info("Autojoining Mafia game from live room update...")
-                        await self.send_room_command("/mafia join")
+                        asyncio.create_task(self._delayed_autojoin())
 
-                    if not self.config.gameplay.silent_mode:
+                    if self._ready_for_live_games and not self.config.gameplay.silent_mode:
                         me_action = self._extract_me_action(line, self.config.showdown.username)
                         if me_action is not None:
+                            # The bot's own message has to literally be
+                            # "/ME" (caps) to get the loud/capitalized
+                            # rendering -- detection stays case-insensitive
+                            # (someone else may type either), but the
+                            # bot's own reply always uses the caps form.
                             mirrored = f"/ME {me_action}" if me_action else "/ME"
                             logger.info(f"Mirroring /ME action: {mirrored}")
                             await self.send_room_command(mirrored)
 
                     if (
-                        not self.config.gameplay.silent_mode
+                        self._ready_for_live_games
+                        and not self.config.gameplay.silent_mode
                         and self.tracker.state == "DAY"
                         and self.tracker.in_game
                         and not self.tracker.eliminated
@@ -604,7 +757,7 @@ class MafiaBot:
         if event == "SIGNUPS":
             if self.config.gameplay.autojoin:
                 logger.info("Autojoining Mafia game...")
-                await self.send_room_command("/mafia join")
+                asyncio.create_task(self._delayed_autojoin())
                 
         elif event == "STARTED":
             self.strategy.reset()
@@ -612,6 +765,8 @@ class MafiaBot:
             self._current_town_read = None
             self._own_role = None
             self._claimed_this_day = False
+            self._has_gun = False
+            self._idea_picked = False
             # A line remembered before this game started (signups chatter,
             # or leftover from a previous game) isn't commentary on anything
             # happening in this game -- don't let it get quoted back later.
@@ -657,6 +812,13 @@ class MafiaBot:
 
             session = self.tracker.get_game_session()
             if self.tracker.in_game:
+                role_action = self._choose_role_action(session)
+                if role_action:
+                    verb, target = role_action
+                    logger.info(f"Night action: using {verb} on {target}.")
+                    await self.send_room_command(f"/mafia action {verb} {target}")
+                    return
+
                 target = self._choose_night_action_target(session)
                 if target:
                     logger.info(f"Night action: targeting {target} with a random kill.")
@@ -669,9 +831,7 @@ class MafiaBot:
             if self._random_actions_task:
                 self._random_actions_task.cancel()
 
-            logger.info("Game finished. Sending gg message.")
-            await self.send_room_command("gg")
-
+            ragebait_message = None
             if not self.config.gameplay.silent_mode:
                 from ..io.player_names import names_match
 
@@ -680,13 +840,18 @@ class MafiaBot:
                 # the tracker prunes eliminated players out of .players as
                 # the game goes on.
                 all_players = list(dict.fromkeys(list(self.tracker.players) + list(self.tracker.dead_players)))
-                other_players = [p for p in all_players if not names_match(p, self.config.showdown.username)]
 
-                ragebait = random.choice(RAGEBAIT_LINES)
-                if other_players:
-                    ragebait = f"{ragebait} {' '.join(other_players)}"
-                logger.info(f"Ragebaiting after game end: {ragebait}")
-                await self._send_chat_message(ragebait)
+                if len(all_players) >= MIN_PLAYERS_FOR_TRASH_TALK:
+                    other_players = [p for p in all_players if not names_match(p, self.config.showdown.username)]
+
+                    ragebait_message = random.choice(RAGEBAIT_LINES)
+                    if other_players:
+                        ragebait_message = f"{ragebait_message} {' '.join(other_players)}"
+
+            # Computed above (before the reset below wipes tracker state),
+            # but the actual "gg"/ragebait send is delayed -- see
+            # _delayed_game_end_chat.
+            asyncio.create_task(self._delayed_game_end_chat(ragebait_message))
 
             # Log completed game to database
             await self._save_game_to_db()
@@ -698,6 +863,8 @@ class MafiaBot:
             self._current_town_read = None
             self._own_role = None
             self._claimed_this_day = False
+            self._has_gun = False
+            self._idea_picked = False
 
     def _build_question_prompt(self, session) -> Optional[str]:
         from ..io.player_names import names_match, player_identity_key
@@ -863,7 +1030,7 @@ class MafiaBot:
             logger.info("Running first vote evaluation of the day.")
             await self._evaluate_and_vote()
 
-    def _pick_random_vote_target(self, session) -> Optional[str]:
+    def _pick_random_vote_target(self, session, invert: bool = False) -> Optional[str]:
         """Picks a random target for an unsure/exploratory vote.
 
         The "alive" pool and the "randvote candidate" pool aren't the same
@@ -873,6 +1040,11 @@ class MafiaBot:
         everyone else. Falls back to the full alive pool if that would
         leave no candidates at all (e.g. in a tiny/short game where the
         model has too little signal to read anyone as confidently town).
+
+        `invert` flips this for themes like Modexe, where voting is
+        actually a benefit (e.g. handing out a gun) -- there, a confident
+        scum read should be excluded from random guessing instead, since
+        randomly rewarding a suspected mafia player would be the mistake.
         """
         from ..io.player_names import names_match, player_identity_key
 
@@ -882,15 +1054,167 @@ class MafiaBot:
             return None
 
         predictions = self._get_strategy_full_predictions(session)
-        town_read_keys = {
-            player_identity_key(name)
-            for name, prob_mafia in predictions
-            if (1.0 - prob_mafia) >= self.strategy.min_confidence
-        }
-        non_town_targets = [p for p in valid_targets if player_identity_key(p) not in town_read_keys]
+        if invert:
+            excluded_keys = {
+                player_identity_key(name)
+                for name, prob_mafia in predictions
+                if prob_mafia >= self.strategy.min_confidence
+            }
+        else:
+            excluded_keys = {
+                player_identity_key(name)
+                for name, prob_mafia in predictions
+                if (1.0 - prob_mafia) >= self.strategy.min_confidence
+            }
+        remaining_targets = [p for p in valid_targets if player_identity_key(p) not in excluded_keys]
 
-        pool = non_town_targets or valid_targets
+        pool = remaining_targets or valid_targets
         return random.choice(pool)
+
+    def _is_modexe_theme(self) -> bool:
+        """"Modexe" isn't a real theme's on-the-record name -- it's a
+        community nickname for "Modified Execution" (confirmed live: its
+        actual description is "Vote someone to give them a kill... If the
+        person the Mafia corrupted gets the gun, they die instead!"). It
+        flips what a day vote does -- voting someone hands them a gun
+        instead of lynching them -- so the bot should be voting who it
+        trusts (town reads), not who it suspects.
+        """
+        theme = getattr(self.tracker, "theme", None)
+        if not theme:
+            return False
+        theme_lower = theme.lower()
+        return any(name in theme_lower for name in ("modexe", "modified execution", "mod.exe"))
+
+    def _is_popcorn_theme(self) -> bool:
+        """Popcorn hands one player a gun that replaces the day vote entirely
+        (the gun-holder "shoots" instead of voting) -- only ever a Vanilla
+        Townie, per the rules text.
+        """
+        theme = getattr(self.tracker, "theme", None)
+        return bool(theme) and "popcorn" in theme.lower()
+
+    @staticmethod
+    def _sender_from_line(line: str) -> Optional[str]:
+        parts = line.split("|")
+        if len(parts) > 3 and parts[1] == "c:":
+            return parts[3]
+        if len(parts) > 2 and parts[1] == "c":
+            return parts[2]
+        return None
+
+    def _check_gun_pickup(self, line: str) -> None:
+        """Detects whether this bot now holds the Popcorn gun.
+
+        Three tells, checked in order: a bolded "**{name} has gun**"
+        announcement (unambiguous enough to accept from anyone), the host's
+        plain-text "{name} has gun" chat announcement (confirmed live --
+        not bolded -- but only trusted when the sender is confirmed to be
+        the tracked host, since any player could type the same words as a
+        joke or a guess), and the death/role-reveal broadcast ("{name}'s
+        role was Vanilla Townie"), which theoretically fires when a shot
+        that missed Mafia hands the gun to its Town survivor, though live
+        play so far has only ever shown that death reflected in the
+        votes-panel's Dead Players list, not as a chat broadcast -- kept as
+        a fallback in case a differently-hosted game does broadcast it.
+        """
+        if self._has_gun or not self._is_popcorn_theme():
+            return
+        if not self._own_role or "vanilla townie" not in self._own_role.lower():
+            return
+
+        from ..io.player_names import names_match
+
+        username = self.config.showdown.username
+        message_text = self._message_text_from_line(line).strip()
+
+        match = BOLD_HAS_GUN_RE.search(message_text)
+        if match and names_match(match.group(1).strip(), username):
+            self._has_gun = True
+        else:
+            match = PLAIN_HAS_GUN_RE.search(message_text)
+            if match and names_match(match.group(1).strip(), username):
+                host = getattr(self.tracker, "host", None)
+                sender = self._sender_from_line(line)
+                if host and sender and names_match(sender, host):
+                    self._has_gun = True
+            else:
+                match = GUN_ROLE_REVEAL_RE.search(line)
+                if match and "vanilla townie" in match.group(2).strip().lower() and names_match(match.group(1).strip(), username):
+                    self._has_gun = True
+
+        if self._has_gun:
+            logger.info("Detected this bot now holds the Popcorn gun; will shoot scumreads instead of voting.")
+
+    @staticmethod
+    def _choose_idea_pick(options: list[tuple[str, str, Optional[str]]]) -> Optional[str]:
+        """Picks a Town-aligned option out of an IDEA module's remaining
+        choices, avoiding anything confirmed Mafia-aligned. Falls back to
+        any not-confirmed-Mafia option (alignment unclear, e.g. a solo
+        "aligned with yourself" role) if no Town option is offered, and
+        gives up (returns None, leaving the pick to whatever the game does
+        by default) only if every option is confirmed Mafia.
+        """
+        town_options = [opt for opt in options if (opt[2] or "").lower() == "town"]
+        if town_options:
+            return town_options[0][0]
+
+        safe_options = [opt for opt in options if (opt[2] or "").lower() != "mafia"]
+        if safe_options:
+            return safe_options[0][0]
+
+        return None
+
+    async def _maybe_pick_idea_role(self, line: str) -> None:
+        if getattr(self, "_idea_picked", False):
+            return
+
+        options = self.tracker.parse_idea_options_if_present(line)
+        if not options:
+            return
+
+        choice = self._choose_idea_pick(options)
+        if not choice:
+            return
+
+        self._idea_picked = True
+        role_names = [name for _, name, _ in options]
+        logger.info(f"IDEA pick: choosing role id '{choice}' from options {role_names}.")
+        await self.send_room_command(f"/mafia ideapick role, {choice}")
+
+    async def _maybe_react_to_clanker(self, line: str) -> None:
+        """Troll mode only: gets offended at "clanker" and shifts its vote
+        onto whoever said it a moment later. Off by default -- this is a
+        for-fun gag, not something to leave on for regular play.
+        """
+        if not self.config.gameplay.troll_mode or self.config.gameplay.silent_mode:
+            return
+
+        sender = self._sender_from_line(line)
+        if not sender:
+            return
+
+        from ..io.player_names import canonical_player_name, names_match
+
+        # Showdown echoes our own outgoing messages back through the same
+        # queue -- never react to ourselves.
+        if names_match(sender, self.config.showdown.username):
+            return
+
+        message_text = self._message_text_from_line(line)
+        if not CLANKER_RE.search(message_text):
+            return
+
+        target = canonical_player_name(sender)
+        logger.info(f"Troll mode: {target} said 'clanker'; reacting offended.")
+        await self._send_chat_message(random.choice(CLANKER_OFFENDED_LINES))
+
+        await asyncio.sleep(1)
+
+        if self.tracker.state == "DAY" and self.tracker.in_game and not self.tracker.eliminated:
+            logger.info(f"Troll mode: shifting vote onto {target}.")
+            await self.send_room_command(f"/mafia vote {target}")
+            self._current_vote_target = target
 
     async def _evaluate_and_vote(self, allow_random_fallback: bool = False):
         if self.tracker.state != "DAY" or self.tracker.eliminated:
@@ -906,23 +1230,39 @@ class MafiaBot:
             logger.info("Bot is not participating in the current game. Skipping vote evaluation.")
             return
 
-        volo_confidence = None
-        if self._is_volo(session):
-            volo_confidence = self.config.gameplay.volo_min_confidence
-            logger.info(f"VoLo detected; raising vote confidence bar to {volo_confidence}.")
+        is_modexe = self._is_modexe_theme()
+        has_gun = getattr(self, "_has_gun", False) and self._is_popcorn_theme()
 
-        target, confidence = self._get_strategy_vote(session, min_confidence=volo_confidence)
+        if is_modexe:
+            # Voting = handing someone a gun here, so the "vote decision"
+            # is who we trust most, not who we suspect.
+            logger.info("Modexe theme detected; voting a town read instead of a suspect.")
+            target, confidence = self._get_strategy_town_read(session)
+        else:
+            volo_confidence = None
+            if self._is_volo(session):
+                volo_confidence = self.config.gameplay.volo_min_confidence
+                logger.info(f"VoLo detected; raising vote confidence bar to {volo_confidence}.")
+
+            target, confidence = self._get_strategy_vote(session, min_confidence=volo_confidence)
+
         is_random_guess = False
 
         if not target and allow_random_fallback:
             # Last evaluation of the day and still no confident read -- take
             # a random guess rather than sitting out the vote entirely.
-            target = self._pick_random_vote_target(session)
+            target = self._pick_random_vote_target(session, invert=is_modexe)
             is_random_guess = target is not None
 
         if target:
             if target != self._current_vote_target:
-                if is_random_guess:
+                if has_gun:
+                    # Holding the Popcorn gun replaces the day vote entirely
+                    # -- shoot the biggest scumread in chat instead of
+                    # submitting a normal vote command.
+                    logger.info(f"Popcorn gun held; shooting {target} (confidence: {confidence:.2%}). Previous: {self._current_vote_target}")
+                    await self._send_chat_message(f"**shoot {target}**")
+                elif is_random_guess:
                     logger.info(f"No confident read; randomly voting {target} at the last moment.")
                     await self.send_room_command(f"/mafia vote {target}")
                 else:
@@ -930,11 +1270,12 @@ class MafiaBot:
                     await self._cast_vote_with_optional_comment(target)
                 self._current_vote_target = target
             else:
-                logger.info(f"Maintaining current vote on {target} (confidence: {confidence:.2%})")
+                logger.info(f"Maintaining current {'shoot target' if has_gun else 'vote'} on {target} (confidence: {confidence:.2%})")
         else:
             if self._current_vote_target:
-                logger.info("No clear target meets confidence threshold. Unvoting.")
-                await self.send_room_command("/mafia unvote")
+                if not has_gun:
+                    logger.info("No clear target meets confidence threshold. Unvoting.")
+                    await self.send_room_command("/mafia unvote")
                 self._current_vote_target = None
 
         town_read, town_confidence = self._get_strategy_town_read(session)

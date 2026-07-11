@@ -1,6 +1,6 @@
 import logging
 import re
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Tuple
 
 from ..data.flips import extract_flips
 from ..data.models import GameSession
@@ -67,6 +67,38 @@ VOTES_LINE_RE = re.compile(r"^(?P<count>\d+)\*?\s+(?P<target>.+?)\s+\((?P<voters
 # work out the mafia-vs-total split for VoLo/parity tracking.
 ORIGINAL_ROLELIST_RE = re.compile(r"original\s+rolelist:\s*(?P<roles>.+)", re.IGNORECASE)
 
+# The room's page panel (a `|pagehtml|` update, e.g. from viewing/refreshing
+# the votes page) includes a line like:
+#   <span style="font-weight:bold;">Theme</span>: CCTV
+# This panel arrives under its own pseudo-room (e.g. "view-mafia-mafia"),
+# not the main chat room, so it's parsed independently of the normal
+# room-gated message flow rather than through process_message.
+THEME_RE = re.compile(r"Theme</span>:\s*([^<]+)", re.IGNORECASE)
+
+# Same panel also includes the host's name, e.g. <h3>Host: ghostlyplanets</h3>
+HOST_RE = re.compile(r"Host:\s*([^<]+)</h3>", re.IGNORECASE)
+
+# During an IDEA module, the same panel gets an "IDEA information" section
+# with one clickable button per still-available role option, e.g.
+#   <button class="button" name="send" value="/msgroom mafia,/mafia ideapick
+#   role, mafiaoneshotstrongman">Mafia One-Shot Strongman</button>
+# The already-picked option (and "clear" before any pick is made) render as
+# `class="button disabled"` with no `name="send"`/`value`, so this pattern
+# naturally only matches options that are still choosable. The "clear"
+# button itself (once enabled, after a pick) has an empty role id after the
+# comma, filtered out by the caller.
+IDEA_OPTION_RE = re.compile(
+    r'<button class="button" name="send" value="/msgroom mafia,/mafia ideapick role,\s*([^"]*)">([^<]+)</button>'
+)
+
+# The panel's "Role details" section spells out each option's alignment,
+# e.g. "...You are aligned with the <span ...>Town</span>." -- paired with
+# IDEA_OPTION_RE by matching role name to `<summary>{name}</summary>`.
+IDEA_ROLE_ALIGNMENT_RE = re.compile(
+    r"<summary>([^<]+)</summary>.*?aligned with (?:the\s+)?<span[^>]*>([^<]+)</span>",
+    re.DOTALL,
+)
+
 # The room automatically posts these as the day's deadline approaches, e.g.
 # "**3 minutes left!**" / "**1 minute left!**"
 THREE_MIN_LEFT_RE = re.compile(r"3\s*minutes?\s*left", re.IGNORECASE)
@@ -93,6 +125,8 @@ class GameTracker:
         self.hammer_count: Optional[int] = None
         self.live_vote_counts: dict = {}
         self.original_role_tokens: List[str] = []
+        self.theme: Optional[str] = None
+        self.host: Optional[str] = None
         self.deadline_warning: Optional[str] = None  # None, "3_minutes", or "1_minute"
         self._pending_sub_out: Optional[str] = None
 
@@ -138,6 +172,8 @@ class GameTracker:
         self.hammer_count = None
         self.live_vote_counts = {}
         self.original_role_tokens = []
+        self.theme = None
+        self.host = None
         self.deadline_warning = None
         self._pending_sub_out = None
 
@@ -405,6 +441,58 @@ class GameTracker:
         self.original_role_tokens = tokens
         logger.info(f"Parsed original rolelist: {tokens}")
         return True
+
+    def parse_theme_if_present(self, line: str) -> bool:
+        """Extracts the game's theme name from a `/mafia votes` page-panel
+        dump (a `|pagehtml|` update). Called independently of
+        process_message, since this panel arrives under its own pseudo-room
+        rather than the main chat room.
+        """
+        match = THEME_RE.search(line)
+        if not match:
+            return False
+
+        theme = match.group(1).strip()
+        if theme and theme != self.theme:
+            self.theme = theme
+            logger.info(f"Detected game theme: {theme}")
+        return True
+
+    def parse_host_if_present(self, line: str) -> bool:
+        """Extracts the game host's name from the same page-panel dump that
+        carries the theme (see parse_theme_if_present).
+        """
+        match = HOST_RE.search(line)
+        if not match:
+            return False
+
+        host = match.group(1).strip()
+        if host and host != self.host:
+            self.host = host
+            logger.info(f"Detected game host: {host}")
+        return True
+
+    def parse_idea_options_if_present(self, line: str) -> List[Tuple[str, str, Optional[str]]]:
+        """Extracts the still-choosable IDEA options from the same
+        page-panel dump (see parse_theme_if_present), each as
+        (role_id, role_name, alignment_or_None) -- alignment is None when
+        the panel's role-details text doesn't spell it out as a plain
+        Town/Mafia/etc. span (e.g. solo-flavoured "aligned with yourself"
+        wincon text).
+        """
+        alignments = {
+            name.strip(): alignment.strip()
+            for name, alignment in IDEA_ROLE_ALIGNMENT_RE.findall(line)
+        }
+
+        options = []
+        for role_id, role_name in IDEA_OPTION_RE.findall(line):
+            role_id = role_id.strip()
+            role_name = role_name.strip()
+            if not role_id or role_name.lower() == "clear":
+                continue
+            options.append((role_id, role_name, alignments.get(role_name)))
+        return options
 
     def _prune_dead_players(self, bot_username: Optional[str] = None) -> None:
         from ..io.parser import ELIMINATION_RE

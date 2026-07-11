@@ -42,6 +42,8 @@ class GameplayConfig:
     volo_min_confidence: float = 0.75
     silent_mode: bool = False
     auto_save_games: bool = True
+    autojoin_delay_seconds: float = 5.0
+    troll_mode: bool = False
 
 
 @dataclass
@@ -97,6 +99,8 @@ class BotConfig:
                 volo_min_confidence=float(gameplay_data.get("volo_min_confidence", 0.75)),
                 silent_mode=bool(gameplay_data.get("silent_mode", False)),
                 auto_save_games=bool(gameplay_data.get("auto_save_games", True)),
+                autojoin_delay_seconds=float(gameplay_data.get("autojoin_delay_seconds", 5.0)),
+                troll_mode=bool(gameplay_data.get("troll_mode", False)),
             ),
             database=DatabaseConfig(
                 db_path=str(resolve_repo_path(database_data.get("db_path", "data/mafia.db"))),
