@@ -44,6 +44,7 @@ class GameplayConfig:
     auto_save_games: bool = True
     autojoin_delay_seconds: float = 5.0
     troll_mode: bool = False
+    plurality_defense_min_confidence: float = 0.85
 
 
 @dataclass
@@ -101,6 +102,7 @@ class BotConfig:
                 auto_save_games=bool(gameplay_data.get("auto_save_games", True)),
                 autojoin_delay_seconds=float(gameplay_data.get("autojoin_delay_seconds", 5.0)),
                 troll_mode=bool(gameplay_data.get("troll_mode", False)),
+                plurality_defense_min_confidence=float(gameplay_data.get("plurality_defense_min_confidence", 0.85)),
             ),
             database=DatabaseConfig(
                 db_path=str(resolve_repo_path(database_data.get("db_path", "data/mafia.db"))),

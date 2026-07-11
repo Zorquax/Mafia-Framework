@@ -119,6 +119,16 @@ CLANKER_OFFENDED_LINES = [
     "yeah no you're getting voted for that",
 ]
 
+# Fired when the bot is very confident the current vote-plurality leader is
+# actually town -- "{target}" is filled in with that player's name.
+TOWN_DEFENSE_LINES = [
+    "{target} is town, get off!",
+    "yall are wrong, {target} is town",
+    "get off {target} they're town",
+    "{target} is literally town trust me",
+    "wrong read, {target} is town",
+]
+
 
 class MafiaBot:
     def __init__(self, config_path: str):
@@ -143,6 +153,7 @@ class MafiaBot:
         self._claimed_this_day: bool = False
         self._has_gun: bool = False
         self._idea_picked: bool = False
+        self._defended_plurality_target: Optional[str] = None
         self._main_task: Optional[asyncio.Task] = None
         self._random_actions_task: Optional[asyncio.Task] = None
         self._ready_for_live_games: bool = False
@@ -379,6 +390,51 @@ class MafiaBot:
         )
         return bot_count == max_count
 
+    def _get_plurality_leader(self) -> Optional[str]:
+        """Returns the sole current vote-tally leader's name, or None if
+        there's no live tally, nobody has any votes, or the lead is tied
+        between multiple players (too ambiguous to react to).
+        """
+        live_counts = getattr(self.tracker, "live_vote_counts", None)
+        if not live_counts:
+            return None
+
+        max_count = max(live_counts.values())
+        if max_count <= 0:
+            return None
+
+        leaders = [target for target, count in live_counts.items() if count == max_count]
+        if len(leaders) != 1:
+            return None
+        return leaders[0]
+
+    async def _maybe_defend_town_plurality(self) -> None:
+        """Reacts in chat if the bot is very confident the current vote
+        plurality leader is town -- but not in themes like Modexe/Popcorn
+        where getting voted is actually good for town (a "gun" mechanic),
+        since defending someone from that would be actively bad advice.
+        Fires at most once per plurality leader (reset each new day).
+        """
+        if self.config.gameplay.silent_mode:
+            return
+        if self._is_modexe_theme() or self._is_popcorn_theme():
+            return
+
+        leader = self._get_plurality_leader()
+        if not leader or leader == self._defended_plurality_target:
+            return
+
+        session = self.tracker.get_game_session()
+        town_read, confidence = self._get_strategy_town_read(session)
+        if not town_read or town_read != leader:
+            return
+        if confidence < self.config.gameplay.plurality_defense_min_confidence:
+            return
+
+        self._defended_plurality_target = leader
+        logger.info(f"Defending confident town read {leader} from plurality (confidence: {confidence:.2%}).")
+        await self._send_chat_message(random.choice(TOWN_DEFENSE_LINES).format(target=leader))
+
     async def _maybe_claim_if_plurality_near_deadline(self):
         """Proactively claims if the bot is the current plurality target
         with little time left in the day, even when it isn't exactly one
@@ -498,9 +554,10 @@ class MafiaBot:
 
     def _choose_role_action(self, session) -> Optional[tuple[str, str]]:
         """Returns (action_verb, target) for one of the specifically
-        programmed role night actions (Doctor/Cop/Pretty Lady/Jailkeeper),
-        or None if the bot's role doesn't match one of those -- callers
-        should fall back to the generic Mafia-kill/idle logic in that case.
+        programmed role night actions (Doctor/Cop/Pretty Lady/Jailkeeper/
+        Vigilante), or None if the bot's role doesn't match one of those --
+        callers should fall back to the generic Mafia-kill/idle logic in
+        that case.
 
         Uses an exact (case-insensitive) role match rather than a substring
         check -- this ruleset has mechanically-different roles with similar
@@ -512,7 +569,7 @@ class MafiaBot:
             return None
 
         role = self._own_role.strip().lower()
-        if role not in {"doctor", "cop", "pretty lady", "jailkeeper"}:
+        if role not in {"doctor", "cop", "pretty lady", "jailkeeper", "vigilante"}:
             return None
 
         from ..io.player_names import names_match
@@ -543,11 +600,22 @@ class MafiaBot:
             _, scum_reads = self._get_confidence_reads(session)
             return "Pretty Lady", random.choice(scum_reads or valid_targets)
 
-        # role == "jailkeeper"
-        target = days_vote_target_if_alive()
-        if target:
-            return "Jailkeeper", target
-        return "Jailkeeper", random.choice(valid_targets)
+        if role == "jailkeeper":
+            target = days_vote_target_if_alive()
+            if target:
+                return "Jailkeeper", target
+            return "Jailkeeper", random.choice(valid_targets)
+
+        # role == "vigilante" -- kills every single night, always going for
+        # the single highest-suspicion read (not a random pick among an
+        # unordered confident set, unlike Cop), falling back to a random
+        # valid target only if predictions aren't available at all.
+        predictions = self._get_strategy_full_predictions(session)
+        if predictions:
+            target = max(predictions, key=lambda item: item[1])[0]
+        else:
+            target = random.choice(valid_targets)
+        return "Vigilante", target
 
     async def send_room_command(self, command: str):
         msg = f"{self.connection.room}|{command}"
@@ -767,6 +835,7 @@ class MafiaBot:
             self._claimed_this_day = False
             self._has_gun = False
             self._idea_picked = False
+            self._defended_plurality_target = None
             # A line remembered before this game started (signups chatter,
             # or leftover from a previous game) isn't commentary on anything
             # happening in this game -- don't let it get quoted back later.
@@ -780,6 +849,7 @@ class MafiaBot:
         elif event == "DAY":
             logger.info("New day started! Will run the first vote evaluation shortly...")
             self._claimed_this_day = False
+            self._defended_plurality_target = None
             if not self._random_actions_task or self._random_actions_task.done():
                 self._random_actions_task = asyncio.create_task(self._random_actions_loop())
             asyncio.create_task(self._delayed_first_evaluation())
@@ -791,6 +861,7 @@ class MafiaBot:
                 and not self.tracker.eliminated
             ):
                 await self._maybe_claim_at_v1()
+                await self._maybe_defend_town_plurality()
 
         elif event in ("DEADLINE_3MIN", "DEADLINE_1MIN"):
             # The room only announces these two automatic warnings, so together
@@ -865,6 +936,7 @@ class MafiaBot:
             self._claimed_this_day = False
             self._has_gun = False
             self._idea_picked = False
+            self._defended_plurality_target = None
 
     def _build_question_prompt(self, session) -> Optional[str]:
         from ..io.player_names import names_match, player_identity_key
@@ -1079,12 +1151,20 @@ class MafiaBot:
         flips what a day vote does -- voting someone hands them a gun
         instead of lynching them -- so the bot should be voting who it
         trusts (town reads), not who it suspects.
+
+        "Cult.exe" and "Mime.exe" are variants on the same mod.exe voting
+        mechanic (confirmed live for Mime.exe: "mod.exe with Mimes! Mimes
+        exit the game if they are 'voted out' (given the gun)") -- same
+        vote-inversion applies.
         """
         theme = getattr(self.tracker, "theme", None)
         if not theme:
             return False
         theme_lower = theme.lower()
-        return any(name in theme_lower for name in ("modexe", "modified execution", "mod.exe"))
+        return any(
+            name in theme_lower
+            for name in ("modexe", "modified execution", "mod.exe", "cult.exe", "mime.exe")
+        )
 
     def _is_popcorn_theme(self) -> bool:
         """Popcorn hands one player a gun that replaces the day vote entirely

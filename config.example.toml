@@ -19,6 +19,7 @@ silent_mode = false
 auto_save_games = true
 autojoin_delay_seconds = 5.0
 troll_mode = false
+plurality_defense_min_confidence = 0.85
 
 [database]
 db_path = "data/mafia.db"

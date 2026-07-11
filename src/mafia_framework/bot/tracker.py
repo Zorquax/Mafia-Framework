@@ -43,9 +43,14 @@ SPECTATE_STATE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Regex to detect night phase start
+# Regex to detect night phase start. Some hosts/rulesets phrase this as
+# "Night 2. Submit whether you are using an action or idle..." (confirmed
+# live) or "It's night in the game of Mafia! Send in an action or idle."
+# instead of "Night X has begun" -- both are matched too, or a night phase
+# would silently never register (and the bot would never submit its idle
+# or night action) for those hosts.
 NIGHT_START_RE = re.compile(
-    r"(night\s+(?P<night>\d+)\s+has\s+begun|night\s+(?P<night_num>\d+)\s+starts|day\s+\d+\s+has\s+ended|day\s+\d+\s+ended)",
+    r"(night\s+(?P<night>\d+)\s+has\s+begun|night\s+(?P<night_num>\d+)\s+starts|day\s+\d+\s+has\s+ended|day\s+\d+\s+ended|night\s+\d+\.\s*submit|it'?s\s+night\s+in\s+the\s+game\s+of\s+mafia)",
     re.IGNORECASE
 )
 

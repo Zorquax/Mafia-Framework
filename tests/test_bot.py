@@ -88,6 +88,32 @@ class TestBotComponents(unittest.TestCase):
         self.assertEqual(tracker.state, "IDLE")
         self.assertEqual(event, "FINISHED")
 
+    def test_night_detected_for_submit_action_or_idle_phrasing(self):
+        # Confirmed live: some hosts phrase the night marker as "Night 2.
+        # Submit whether you are using an action or idle..." instead of
+        # "Night X has begun" -- this used to never register as NIGHT.
+        tracker = GameTracker()
+        tracker.state = "DAY"
+
+        event = tracker.process_message(
+            '|raw|<div class="broadcast-blue">Night 2. Submit whether you are using an '
+            "action or idle. If you are using an action, DM your action to the host.</div>"
+        )
+
+        self.assertEqual(tracker.state, "NIGHT")
+        self.assertEqual(event, "NIGHT")
+
+    def test_night_detected_for_its_night_in_the_game_phrasing(self):
+        tracker = GameTracker()
+        tracker.state = "DAY"
+
+        event = tracker.process_message(
+            "|notify|It's night in the game of Mafia! Send in an action or idle."
+        )
+
+        self.assertEqual(tracker.state, "NIGHT")
+        self.assertEqual(event, "NIGHT")
+
     def test_strategy_voting_without_model_returns_none(self):
         session = GameSession(
             source="test",
@@ -376,6 +402,16 @@ class TestBotComponents(unittest.TestCase):
         # name in the catalog is "Modified Execution".
         bot = MafiaBot.__new__(MafiaBot)
         bot.tracker = SimpleNamespace(theme="Modified Execution")
+        self.assertTrue(bot._is_modexe_theme())
+
+    def test_is_modexe_theme_true_for_cult_exe(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(theme="Cult.exe")
+        self.assertTrue(bot._is_modexe_theme())
+
+    def test_is_modexe_theme_true_for_mime_exe(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(theme="mime.exe")
         self.assertTrue(bot._is_modexe_theme())
 
     def test_is_modexe_theme_false_for_other_themes(self):
@@ -1037,19 +1073,23 @@ class TestBotComponents(unittest.TestCase):
         bot = MafiaBot.__new__(MafiaBot)
         bot.tracker = SimpleNamespace(state="DAY", in_game=True, eliminated=False)
         bot._maybe_claim_at_v1 = AsyncMock()
+        bot._maybe_defend_town_plurality = AsyncMock()
 
         asyncio.run(bot._handle_tracker_event("VOTES_UPDATE"))
 
         bot._maybe_claim_at_v1.assert_awaited_once()
+        bot._maybe_defend_town_plurality.assert_awaited_once()
 
     def test_votes_update_event_skipped_when_not_in_active_day(self):
         bot = MafiaBot.__new__(MafiaBot)
         bot.tracker = SimpleNamespace(state="NIGHT", in_game=True, eliminated=False)
         bot._maybe_claim_at_v1 = AsyncMock()
+        bot._maybe_defend_town_plurality = AsyncMock()
 
         asyncio.run(bot._handle_tracker_event("VOTES_UPDATE"))
 
         bot._maybe_claim_at_v1.assert_not_awaited()
+        bot._maybe_defend_town_plurality.assert_not_awaited()
 
     def test_is_plurality_target_true_when_bot_has_the_most_votes(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -1071,6 +1111,129 @@ class TestBotComponents(unittest.TestCase):
         bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
 
         self.assertFalse(bot._is_plurality_target())
+
+    def test_get_plurality_leader_returns_sole_leader(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(live_vote_counts={"Alice": 3, "Bob": 1})
+        self.assertEqual(bot._get_plurality_leader(), "Alice")
+
+    def test_get_plurality_leader_none_on_tie(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(live_vote_counts={"Alice": 2, "Bob": 2})
+        self.assertIsNone(bot._get_plurality_leader())
+
+    def test_get_plurality_leader_none_when_no_votes(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(live_vote_counts={})
+        self.assertIsNone(bot._get_plurality_leader())
+
+    def test_maybe_defend_town_plurality_reacts_when_very_confident(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
+        bot.tracker = SimpleNamespace(
+            theme="CCTV", live_vote_counts={"Alice": 3, "Bob": 1},
+            get_game_session=Mock(return_value=session),
+        )
+        bot.strategy = Mock()
+        bot.strategy.get_town_read = Mock(return_value=("Alice", 0.9))
+        bot.config = SimpleNamespace(
+            gameplay=SimpleNamespace(silent_mode=False, plurality_defense_min_confidence=0.85),
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+        )
+        bot._defended_plurality_target = None
+        bot._send_chat_message = AsyncMock()
+
+        asyncio.run(bot._maybe_defend_town_plurality())
+
+        bot._send_chat_message.assert_awaited_once()
+        sent_text = bot._send_chat_message.call_args[0][0]
+        self.assertIn("Alice", sent_text)
+        self.assertEqual(bot._defended_plurality_target, "Alice")
+
+    def test_maybe_defend_town_plurality_skips_below_confidence_bar(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
+        bot.tracker = SimpleNamespace(
+            theme="CCTV", live_vote_counts={"Alice": 3, "Bob": 1},
+            get_game_session=Mock(return_value=session),
+        )
+        bot.strategy = Mock()
+        bot.strategy.get_town_read = Mock(return_value=("Alice", 0.6))
+        bot.config = SimpleNamespace(
+            gameplay=SimpleNamespace(silent_mode=False, plurality_defense_min_confidence=0.85),
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+        )
+        bot._defended_plurality_target = None
+        bot._send_chat_message = AsyncMock()
+
+        asyncio.run(bot._maybe_defend_town_plurality())
+
+        bot._send_chat_message.assert_not_awaited()
+
+    def test_maybe_defend_town_plurality_skips_when_leader_not_the_town_read(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
+        bot.tracker = SimpleNamespace(
+            theme="CCTV", live_vote_counts={"Alice": 3, "Bob": 1},
+            get_game_session=Mock(return_value=session),
+        )
+        bot.strategy = Mock()
+        bot.strategy.get_town_read = Mock(return_value=("Bob", 0.95))
+        bot.config = SimpleNamespace(
+            gameplay=SimpleNamespace(silent_mode=False, plurality_defense_min_confidence=0.85),
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+        )
+        bot._defended_plurality_target = None
+        bot._send_chat_message = AsyncMock()
+
+        asyncio.run(bot._maybe_defend_town_plurality())
+
+        bot._send_chat_message.assert_not_awaited()
+
+    def test_maybe_defend_town_plurality_skips_when_modexe(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
+        bot.tracker = SimpleNamespace(
+            theme="Modexe", live_vote_counts={"Alice": 3, "Bob": 1},
+            get_game_session=Mock(return_value=session),
+        )
+        bot.strategy = Mock()
+        bot.strategy.get_town_read = Mock(return_value=("Alice", 0.95))
+        bot.config = SimpleNamespace(
+            gameplay=SimpleNamespace(silent_mode=False, plurality_defense_min_confidence=0.85),
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+        )
+        bot._defended_plurality_target = None
+        bot._send_chat_message = AsyncMock()
+
+        asyncio.run(bot._maybe_defend_town_plurality())
+
+        bot._send_chat_message.assert_not_awaited()
+
+    def test_maybe_defend_town_plurality_only_reacts_once_per_leader(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob"])
+        bot.tracker = SimpleNamespace(
+            theme="CCTV", live_vote_counts={"Alice": 3, "Bob": 1},
+            get_game_session=Mock(return_value=session),
+        )
+        bot.strategy = Mock()
+        bot.strategy.get_town_read = Mock(return_value=("Alice", 0.95))
+        bot.config = SimpleNamespace(
+            gameplay=SimpleNamespace(silent_mode=False, plurality_defense_min_confidence=0.85),
+            showdown=SimpleNamespace(username="BotUser"),
+            database=SimpleNamespace(db_path="dummy.db"),
+        )
+        bot._defended_plurality_target = "Alice"
+        bot._send_chat_message = AsyncMock()
+
+        asyncio.run(bot._maybe_defend_town_plurality())
+
+        bot._send_chat_message.assert_not_awaited()
 
     def test_maybe_claim_if_plurality_near_deadline_claims_when_leading(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -2372,6 +2535,47 @@ class TestBotComponents(unittest.TestCase):
             result = bot._choose_role_action(session)
 
         self.assertEqual(result, ("Jailkeeper", "Alice"))
+
+    def test_choose_role_action_vigilante_picks_highest_scumread(self):
+        # Unlike Cop, Vigilante always goes for the single top-suspicion
+        # read (argmax), not a random pick among everyone above the
+        # confidence bar.
+        bot = MafiaBot.__new__(MafiaBot)
+        bot._own_role = "Vigilante"
+        bot._current_vote_target = None
+        bot.tracker = SimpleNamespace(dead_players=set())
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"), database=SimpleNamespace(db_path="dummy.db"))
+        bot.strategy = Mock()
+        bot.strategy.min_confidence = 0.55
+        bot.strategy.get_full_predictions = Mock(return_value=[("Alice", 0.6), ("Bob", 0.9), ("Carol", 0.4)])
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob", "Carol", "BotUser"])
+
+        result = bot._choose_role_action(session)
+
+        self.assertEqual(result, ("Vigilante", "Bob"))
+
+    def test_choose_role_action_vigilante_falls_back_to_random_when_no_predictions(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot._own_role = "Vigilante"
+        bot._current_vote_target = None
+        bot.tracker = SimpleNamespace(dead_players=set())
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"), database=SimpleNamespace(db_path="dummy.db"))
+        bot.strategy = Mock()
+        bot.strategy.min_confidence = 0.55
+        bot.strategy.get_full_predictions = Mock(return_value=[])
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob", "BotUser"])
+
+        with patch("random.choice", side_effect=lambda pool: pool[0]):
+            result = bot._choose_role_action(session)
+
+        self.assertEqual(result, ("Vigilante", "Alice"))
+
+    def test_choose_role_action_none_for_mafia_aligned_vigilante_hybrid(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot._own_role = "Mafia Vigilante"
+        session = GameSession(source="test", raw_text="", players=["Alice", "Bob", "BotUser"])
+
+        self.assertIsNone(bot._choose_role_action(session))
 
     def test_choose_role_action_none_for_mafia_aligned_hybrid_role(self):
         # A hybrid like "Mafia Doctor" should defer to the Mafia kill logic
