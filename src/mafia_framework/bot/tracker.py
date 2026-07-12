@@ -83,6 +83,12 @@ THEME_RE = re.compile(r"Theme</span>:\s*([^<]+)", re.IGNORECASE)
 # Same panel also includes the host's name, e.g. <h3>Host: ghostlyplanets</h3>
 HOST_RE = re.compile(r"Host:\s*([^<]+)</h3>", re.IGNORECASE)
 
+# For Mafia-aligned roles, the same panel lists co-faction teammates, e.g.
+# <p><span style="font-weight:bold">Partners</span>: Trimmerz</p> -- a
+# comma-separated list for bigger factions. Needed so a random night kill
+# never targets the bot's own partner.
+PARTNERS_RE = re.compile(r"Partners</span>:\s*([^<]+)", re.IGNORECASE)
+
 # During an IDEA module, the same panel gets an "IDEA information" section
 # with one clickable button per still-available role option, e.g.
 #   <button class="button" name="send" value="/msgroom mafia,/mafia ideapick
@@ -132,6 +138,7 @@ class GameTracker:
         self.original_role_tokens: List[str] = []
         self.theme: Optional[str] = None
         self.host: Optional[str] = None
+        self.partners: List[str] = []
         self.deadline_warning: Optional[str] = None  # None, "3_minutes", or "1_minute"
         self._pending_sub_out: Optional[str] = None
 
@@ -179,6 +186,7 @@ class GameTracker:
         self.original_role_tokens = []
         self.theme = None
         self.host = None
+        self.partners = []
         self.deadline_warning = None
         self._pending_sub_out = None
 
@@ -475,6 +483,21 @@ class GameTracker:
         if host and host != self.host:
             self.host = host
             logger.info(f"Detected game host: {host}")
+        return True
+
+    def parse_partners_if_present(self, line: str) -> bool:
+        """Extracts co-faction teammate names from the same page-panel dump
+        (see parse_theme_if_present) -- only present for Mafia-aligned
+        roles. Needed so a random night kill never targets a partner.
+        """
+        match = PARTNERS_RE.search(line)
+        if not match:
+            return False
+
+        partners = [name.strip() for name in match.group(1).split(",") if name.strip()]
+        if partners and partners != self.partners:
+            self.partners = partners
+            logger.info(f"Detected mafia partners: {partners}")
         return True
 
     def parse_idea_options_if_present(self, line: str) -> List[Tuple[str, str, Optional[str]]]:

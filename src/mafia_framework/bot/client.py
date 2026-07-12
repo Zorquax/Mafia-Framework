@@ -193,15 +193,16 @@ class MafiaBot:
         return voter or None
 
     @staticmethod
-    def _extract_me_action(line: str, bot_username: str) -> Optional[str]:
-        """Returns the action text from someone else's "/me ..." emote line
-        (an empty string for a bare "/me"), or None if this isn't a /me
-        line or it came from the bot itself.
+    def _extract_me_action(line: str, bot_username: str) -> Optional[tuple[str, str]]:
+        """Returns (prefix_as_typed, action_text) from someone else's
+        "/me ..." emote line (action_text is empty for a bare "/me"), or
+        None if this isn't a /me line or it came from the bot itself.
 
         Detection is case-insensitive (someone else may type "/me" or
-        "/ME"), but literally typing "/ME" is what gets Showdown's louder,
-        capitalized rendering -- so the bot's own reply always sends the
-        caps form regardless of which case triggered it.
+        "/ME"), and the prefix is returned exactly as typed so the bot's
+        mirrored reply matches that same case instead of always shouting
+        back in caps -- confirmed live, matching is what's actually wanted,
+        not a fixed caps reply regardless of the trigger's case.
         """
         from ..io.player_names import names_match
 
@@ -219,10 +220,12 @@ class MafiaBot:
             return None
 
         message_text = message_text.strip()
-        if not re.match(r"^/me\b", message_text, re.IGNORECASE):
+        match = re.match(r"^/me\b", message_text, re.IGNORECASE)
+        if not match:
             return None
 
-        return message_text[len("/me"):].strip()
+        prefix = match.group(0)
+        return prefix, message_text[len(prefix):].strip()
 
     @staticmethod
     def _parse_own_role_box(line: str) -> Optional[str]:
@@ -390,6 +393,55 @@ class MafiaBot:
         )
         return bot_count == max_count
 
+    def _find_quickhammer_target(self) -> Optional[str]:
+        """Returns the sole player currently sitting at exactly hammer-1
+        votes in the live tally, excluding the bot itself and its own
+        Mafia partners (quickhammering a teammate would be a self-own).
+        None if there's no live tally, nobody qualifies, or more than one
+        player does (too ambiguous to act on).
+        """
+        if self.tracker.hammer_count is None:
+            return None
+
+        live_counts = getattr(self.tracker, "live_vote_counts", None)
+        if not live_counts:
+            return None
+
+        from ..io.player_names import names_match
+
+        excluded = {self.config.showdown.username, *getattr(self.tracker, "partners", [])}
+        candidates = [
+            target for target, count in live_counts.items()
+            if count == self.tracker.hammer_count - 1
+            and not any(names_match(target, name) for name in excluded)
+        ]
+        if len(candidates) != 1:
+            return None
+        return candidates[0]
+
+    async def _maybe_quickhammer(self) -> None:
+        """VoLo only: if the bot is Mafia-aligned and someone else is
+        sitting at exactly hammer-1 votes, instantly add the bot's own
+        vote to complete the hammer right now, rather than waiting through
+        the normal evaluation cadence -- a lynch sitting at v1 gives the
+        target (or town) a window to talk it down or pull votes before it
+        locks in, and mafia at parity wants that lynch to land immediately.
+        """
+        if not self._own_role or not re.search(r"\bmafia\b", self._own_role, re.IGNORECASE):
+            return
+
+        session = self.tracker.get_game_session()
+        if not self._is_volo(session):
+            return
+
+        target = self._find_quickhammer_target()
+        if not target or target == self._current_vote_target:
+            return
+
+        logger.info(f"VoLo quickhammer: instantly hammering {target} (already at hammer - 1).")
+        await self.send_room_command(f"/mafia vote {target}")
+        self._current_vote_target = target
+
     def _get_plurality_leader(self) -> Optional[str]:
         """Returns the sole current vote-tally leader's name, or None if
         there's no live tally, nobody has any votes, or the lead is tied
@@ -489,24 +541,21 @@ class MafiaBot:
     def _count_mafia_roles(role_tokens: list[str]) -> int:
         return sum(1 for token in role_tokens if "mafia" in token.lower())
 
-    def _is_volo(self, session) -> bool:
-        """True once mafia has (or is one death away from) parity with the
-        rest of the alive players -- the point where a wrong lynch can lose
-        the game outright.
-
-        Computed from the `/mafia originalrolelist` breakdown (mafia count
-        vs total roles) minus mafia deaths confirmed via flips, rather than
+    def _count_alive_mafia(self, session) -> int:
+        """Estimates how many Mafia-aligned players are still alive, from
+        the `/mafia originalrolelist` breakdown (mafia count vs total
+        roles) minus mafia deaths confirmed via flips -- rather than
         needing to know which living player holds which role.
         """
         from ..io.player_names import player_identity_key
 
         role_tokens = getattr(self.tracker, "original_role_tokens", None)
         if not role_tokens:
-            return False
+            return 0
 
         mafia_total = self._count_mafia_roles(role_tokens)
         if mafia_total <= 0:
-            return False
+            return 0
 
         dead_keys = {player_identity_key(p) for p in self.tracker.dead_players}
         mafia_confirmed_dead = sum(
@@ -514,7 +563,16 @@ class MafiaBot:
             if flip.alignment.lower().strip() == "mafia"
             and player_identity_key(flip.player_name) in dead_keys
         )
-        mafia_alive = mafia_total - mafia_confirmed_dead
+        return mafia_total - mafia_confirmed_dead
+
+    def _is_volo(self, session) -> bool:
+        """True once mafia has (or is one death away from) parity with the
+        rest of the alive players -- the point where a wrong lynch can lose
+        the game outright.
+        """
+        mafia_alive = self._count_alive_mafia(session)
+        if mafia_alive <= 0:
+            return False
 
         alive_total = len(session.players)
         if alive_total <= 0:
@@ -522,20 +580,39 @@ class MafiaBot:
 
         return 2 * mafia_alive >= alive_total - 1
 
+    def _is_mylo(self, session) -> bool:
+        """True once the alive player count has dropped to (or below) the
+        MYLO threshold for the current estimated remaining-mafia count:
+        (mafia_alive * 2) + 2 -- e.g. 4 players left with 1 mafia, 6 with
+        2, 8 with 3. Per user direction, the bot insta no-votes rather
+        than guessing once in this range, since a wrong lynch here risks
+        bringing the game to (or past) parity soon after.
+        """
+        mafia_alive = self._count_alive_mafia(session)
+        if mafia_alive <= 0:
+            return False
+
+        alive_total = len(session.players)
+        if alive_total <= 0:
+            return False
+
+        return alive_total <= (mafia_alive * 2) + 2
+
     def _choose_night_action_target(self, session) -> Optional[str]:
-        """Picks a random non-self kill target for the bot's own night
-        action, if its role is Mafia-aligned. Determined from the actual
-        role text learned live via /mafia role -- not from flips, which are
-        only populated after the bot has already died, too late to matter
-        for a night action while it's actually alive and playing.
+        """Picks a random non-self, non-partner kill target for the bot's
+        own night action, if its role is Mafia-aligned. Determined from the
+        actual role text learned live via /mafia role -- not from flips,
+        which are only populated after the bot has already died, too late
+        to matter for a night action while it's actually alive and playing.
         """
         from ..io.player_names import names_match
 
         if not self._own_role or not re.search(r"\bmafia\b", self._own_role, re.IGNORECASE):
             return None
 
+        excluded = {self.config.showdown.username, *getattr(self.tracker, "partners", [])}
         alive_players = [p for p in session.players if p not in self.tracker.dead_players]
-        valid_targets = [p for p in alive_players if not names_match(p, self.config.showdown.username)]
+        valid_targets = [p for p in alive_players if not any(names_match(p, name) for name in excluded)]
         if not valid_targets:
             return None
 
@@ -728,6 +805,7 @@ class MafiaBot:
                 # room filter below.
                 self.tracker.parse_theme_if_present(line)
                 self.tracker.parse_host_if_present(line)
+                self.tracker.parse_partners_if_present(line)
                 await self._maybe_pick_idea_role(line)
 
                 # Only process messages from the target room
@@ -749,15 +827,14 @@ class MafiaBot:
                         asyncio.create_task(self._delayed_autojoin())
 
                     if self._ready_for_live_games and not self.config.gameplay.silent_mode:
-                        me_action = self._extract_me_action(line, self.config.showdown.username)
-                        if me_action is not None:
-                            # The bot's own message has to literally be
-                            # "/ME" (caps) to get the loud/capitalized
-                            # rendering -- detection stays case-insensitive
-                            # (someone else may type either), but the
-                            # bot's own reply always uses the caps form.
-                            mirrored = f"/ME {me_action}" if me_action else "/ME"
-                            logger.info(f"Mirroring /ME action: {mirrored}")
+                        me_match = self._extract_me_action(line, self.config.showdown.username)
+                        if me_match is not None:
+                            # Mirror whatever case actually triggered it --
+                            # a lowercase "/me" gets a lowercase reply, an
+                            # "/ME" gets caps back, matching exactly.
+                            prefix, action = me_match
+                            mirrored = f"{prefix} {action}" if action else prefix
+                            logger.info(f"Mirroring /me action: {mirrored}")
                             await self.send_room_command(mirrored)
 
                     if (
@@ -862,6 +939,7 @@ class MafiaBot:
             ):
                 await self._maybe_claim_at_v1()
                 await self._maybe_defend_town_plurality()
+                await self._maybe_quickhammer()
 
         elif event in ("DEADLINE_3MIN", "DEADLINE_1MIN"):
             # The room only announces these two automatic warnings, so together
@@ -1046,10 +1124,9 @@ class MafiaBot:
 
     async def _random_actions_loop(self):
         """Idle chatter for when nothing's happening, so the bot doesn't sit
-        completely silent all day -- but sparingly, roughly once every 10
-        minutes, not a running commentary. Each cycle either reacts to
-        something someone said or asks a random question, never both, and
-        often neither.
+        completely silent all day. Each cycle either reacts to something
+        someone said or asks a random question, never both, and
+        occasionally neither.
 
         Each message goes through _send_chat_message so it's paced like
         someone actually typing it.
@@ -1060,17 +1137,19 @@ class MafiaBot:
         if self.config.gameplay.silent_mode:
             return
 
+        low, high = self.config.gameplay.random_action_interval_seconds
+
         while self.tracker.state == "DAY" and self.tracker.in_game and not self.tracker.eliminated:
             try:
-                await asyncio.sleep(random.uniform(480.0, 720.0))
+                await asyncio.sleep(random.uniform(low, high))
                 if self.tracker.state != "DAY" or not self.tracker.in_game or self.tracker.eliminated:
                     break
 
                 options = ["question", "none"]
-                weights = [3, 2]
+                weights = [4, 1]
                 if self._remembered_lines:
                     options.insert(0, "reaction")
-                    weights.insert(0, 3)
+                    weights.insert(0, 4)
 
                 action = random.choices(options, weights=weights, k=1)[0]
 
@@ -1312,51 +1391,63 @@ class MafiaBot:
 
         is_modexe = self._is_modexe_theme()
         has_gun = getattr(self, "_has_gun", False) and self._is_popcorn_theme()
+        # MYLO's "a wrong lynch can lose the game" logic assumes a normal
+        # lynch is actually happening -- doesn't apply to Modexe/Popcorn,
+        # where a "vote" hands out a gun instead.
+        is_mylo = not is_modexe and not has_gun and self._is_mylo(session)
 
-        if is_modexe:
-            # Voting = handing someone a gun here, so the "vote decision"
-            # is who we trust most, not who we suspect.
-            logger.info("Modexe theme detected; voting a town read instead of a suspect.")
-            target, confidence = self._get_strategy_town_read(session)
-        else:
-            volo_confidence = None
-            if self._is_volo(session):
-                volo_confidence = self.config.gameplay.volo_min_confidence
-                logger.info(f"VoLo detected; raising vote confidence bar to {volo_confidence}.")
-
-            target, confidence = self._get_strategy_vote(session, min_confidence=volo_confidence)
-
-        is_random_guess = False
-
-        if not target and allow_random_fallback:
-            # Last evaluation of the day and still no confident read -- take
-            # a random guess rather than sitting out the vote entirely.
-            target = self._pick_random_vote_target(session, invert=is_modexe)
-            is_random_guess = target is not None
-
-        if target:
-            if target != self._current_vote_target:
-                if has_gun:
-                    # Holding the Popcorn gun replaces the day vote entirely
-                    # -- shoot the biggest scumread in chat instead of
-                    # submitting a normal vote command.
-                    logger.info(f"Popcorn gun held; shooting {target} (confidence: {confidence:.2%}). Previous: {self._current_vote_target}")
-                    await self._send_chat_message(f"**shoot {target}**")
-                elif is_random_guess:
-                    logger.info(f"No confident read; randomly voting {target} at the last moment.")
-                    await self.send_room_command(f"/mafia vote {target}")
-                else:
-                    logger.info(f"Decided to vote for {target} (confidence: {confidence:.2%}). Previous: {self._current_vote_target}")
-                    await self._cast_vote_with_optional_comment(target)
-                self._current_vote_target = target
+        if is_mylo:
+            if self._current_vote_target != "novote":
+                logger.info("MYLO reached; insta no-voting instead of risking a wrong lynch.")
+                await self.send_room_command("/mafia vote novote")
+                self._current_vote_target = "novote"
             else:
-                logger.info(f"Maintaining current {'shoot target' if has_gun else 'vote'} on {target} (confidence: {confidence:.2%})")
+                logger.info("Maintaining no-vote in MYLO.")
         else:
-            if self._current_vote_target:
-                if not has_gun:
-                    logger.info("No clear target meets confidence threshold. Unvoting.")
-                    await self.send_room_command("/mafia unvote")
-                self._current_vote_target = None
+            if is_modexe:
+                # Voting = handing someone a gun here, so the "vote decision"
+                # is who we trust most, not who we suspect.
+                logger.info("Modexe theme detected; voting a town read instead of a suspect.")
+                target, confidence = self._get_strategy_town_read(session)
+            else:
+                volo_confidence = None
+                if self._is_volo(session):
+                    volo_confidence = self.config.gameplay.volo_min_confidence
+                    logger.info(f"VoLo detected; raising vote confidence bar to {volo_confidence}.")
+
+                target, confidence = self._get_strategy_vote(session, min_confidence=volo_confidence)
+
+            is_random_guess = False
+
+            if not target and allow_random_fallback:
+                # Last evaluation of the day and still no confident read -- take
+                # a random guess rather than sitting out the vote entirely.
+                target = self._pick_random_vote_target(session, invert=is_modexe)
+                is_random_guess = target is not None
+
+            if target:
+                if target != self._current_vote_target:
+                    if has_gun:
+                        # Holding the Popcorn gun replaces the day vote entirely
+                        # -- shoot the biggest scumread in chat instead of
+                        # submitting a normal vote command.
+                        logger.info(f"Popcorn gun held; shooting {target} (confidence: {confidence:.2%}). Previous: {self._current_vote_target}")
+                        await self._send_chat_message(f"**shoot {target}**")
+                    elif is_random_guess:
+                        logger.info(f"No confident read; randomly voting {target} at the last moment.")
+                        await self.send_room_command(f"/mafia vote {target}")
+                    else:
+                        logger.info(f"Decided to vote for {target} (confidence: {confidence:.2%}). Previous: {self._current_vote_target}")
+                        await self._cast_vote_with_optional_comment(target)
+                    self._current_vote_target = target
+                else:
+                    logger.info(f"Maintaining current {'shoot target' if has_gun else 'vote'} on {target} (confidence: {confidence:.2%})")
+            else:
+                if self._current_vote_target:
+                    if not has_gun:
+                        logger.info("No clear target meets confidence threshold. Unvoting.")
+                        await self.send_room_command("/mafia unvote")
+                    self._current_vote_target = None
 
         town_read, town_confidence = self._get_strategy_town_read(session)
         if town_read:
@@ -1494,6 +1585,17 @@ class MafiaBot:
         if self.config.showdown.username and names_match(sender, self.config.showdown.username):
             return
 
+        # Showdown sends its own system UI directives (friend requests,
+        # rich HTML cards, etc.) through this same |pm| format, e.g.
+        # "/raw <span class=...> sent you a friend request!" or
+        # "/uhtml sent-x,<button ... name=\"send\" ...>Accept</button>...".
+        # These aren't something a person typed -- confirmed live, that
+        # second example's literal `name="send"` HTML attribute misfired
+        # the "send me a random name" easter egg below. No real command
+        # this bot understands starts with "/", so skip these entirely.
+        if msg.strip().startswith("/"):
+            return
+
         clean_sender = canonical_player_name(sender)
         logger.info(f"Received PM from {clean_sender}: {msg}")
 
@@ -1503,7 +1605,14 @@ class MafiaBot:
             logger.info(f"Learned own role from PM: {self._own_role}")
             return
 
-        if self.tracker.in_game and not self.tracker.eliminated and "send" in msg.lower():
+        lower_msg = msg.lower()
+        if (
+            self.tracker.in_game
+            and not self.tracker.eliminated
+            and "send" in lower_msg
+            and "random" in lower_msg
+            and "name" in lower_msg
+        ):
             random_player = self._get_random_live_player()
             if random_player:
                 logger.info(f"Responding to PM from {clean_sender} with random player {random_player}")
@@ -1521,6 +1630,7 @@ class MafiaBot:
         # .reset -> clear suspicion multipliers
         # .reads -> full ranked mafia-probability list for every live player
         # .claim -> this game's claim message
+        # .speak [line] -> says the given line in room chat right now
         parts = msg.strip().split()
         if not parts:
             return
@@ -1538,6 +1648,16 @@ class MafiaBot:
                 else:
                     logger.info(f"No claim message available for PM from {clean_sender}")
                     await self.connection.send(f"|/pm {clean_sender}, unknown")
+            return
+
+        if cmd == ".speak" and len(parts) > 1:
+            # Slice rather than re-join parts, so extra/irregular spacing in
+            # what was actually typed survives instead of being collapsed.
+            line_to_speak = msg.strip()[len(parts[0]):].strip()
+            if line_to_speak:
+                logger.info(f"Speaking on request from {clean_sender}: {line_to_speak}")
+                await self._send_chat_message(line_to_speak)
+                await self.connection.send(f"|/pm {clean_sender}, said: {line_to_speak}")
             return
 
         if cmd == ".reads":
