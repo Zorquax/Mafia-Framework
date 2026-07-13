@@ -64,18 +64,30 @@ class TestBotComponents(unittest.TestCase):
         self.assertEqual(tracker.state, "SIGNUPS")
         self.assertEqual(event, "SIGNUPS")
 
-        # 2. Game start / roster announcement -- this is the rolling/role-
-        # distribution period, not Day 1 yet, so state goes to NIGHT (no
-        # chatting) until the real Day 1 marker arrives.
+        # 2a. Roster lock -- just a roster update, not the real game start
+        # (roles haven't been distributed yet at this point).
         event = tracker.process_message("|c:|1779642701|~|**Players (3)**: Alice, Bob, Charlie")
-        self.assertEqual(tracker.state, "NIGHT")
-        self.assertEqual(event, "STARTED")
+        self.assertEqual(tracker.state, "SIGNUPS")
+        self.assertIsNone(event)
         self.assertEqual(tracker.players, ["Alice", "Bob", "Charlie"])
 
-        # 3. Night starts
+        # 2b. The explicit "game is starting" announcement is what actually
+        # begins the game -- this is the rolling/role-distribution period,
+        # not Day 1 yet, so state goes to NIGHT (no chatting) until the
+        # real Day 1 marker arrives.
+        event = tracker.process_message(
+            '|c:|1779642701|~|The game of Mafia is starting!'
+        )
+        self.assertEqual(tracker.state, "NIGHT")
+        self.assertEqual(event, "STARTED")
+
+        # 3. Night starts -- state is already NIGHT from the STARTED
+        # transition above, so this explicit announcement is a duplicate
+        # of the same night and correctly produces no new event (see the
+        # NIGHT_START_RE dedup guard).
         event = tracker.process_message("|c:|1779642701|~|Night 1 has begun.")
         self.assertEqual(tracker.state, "NIGHT")
-        self.assertEqual(event, "NIGHT")
+        self.assertIsNone(event)
 
         # 4. Day starts
         event = tracker.process_message("Day 2. The hammer count is set at 2")
@@ -113,6 +125,26 @@ class TestBotComponents(unittest.TestCase):
 
         self.assertEqual(tracker.state, "NIGHT")
         self.assertEqual(event, "NIGHT")
+
+    def test_night_dedup_guard_prevents_duplicate_night_event(self):
+        # Confirmed live: hosts send both "It's night in the game of
+        # Mafia!" and "Night N. Submit whether..." for the *same* night --
+        # without a dedup guard each one independently re-fired NIGHT,
+        # causing the idle/kill action to be sent twice for one night.
+        tracker = GameTracker()
+        tracker.state = "DAY"
+
+        first_event = tracker.process_message(
+            "|notify|It's night in the game of Mafia! Send in an action or idle."
+        )
+        second_event = tracker.process_message(
+            '|raw|<div class="broadcast-blue">Night 2. Submit whether you are using an '
+            "action or idle. If you are using an action, DM your action to the host.</div>"
+        )
+
+        self.assertEqual(first_event, "NIGHT")
+        self.assertIsNone(second_event)
+        self.assertEqual(tracker.state, "NIGHT")
 
     def test_strategy_voting_without_model_returns_none(self):
         session = GameSession(
@@ -619,17 +651,65 @@ class TestBotComponents(unittest.TestCase):
         ]
         self.assertEqual(MafiaBot._choose_idea_pick(options), "traitorcelebrity")
 
-    def test_choose_idea_pick_gives_up_when_all_options_mafia(self):
+    def test_choose_idea_pick_still_picks_something_when_all_options_mafia(self):
+        # Even the lowest-priority tier still gets picked (the first
+        # listed, since it's a tie) rather than giving up entirely.
         options = [
             ("mafiasecretagent", "Mafia Secret Agent", "Mafia"),
             ("mafiaoneshotstrongman", "Mafia One-Shot Strongman", "Mafia"),
         ]
-        self.assertIsNone(MafiaBot._choose_idea_pick(options))
+        self.assertEqual(MafiaBot._choose_idea_pick(options), "mafiasecretagent")
+
+    def test_choose_idea_pick_prefers_third_party_over_serial_killer(self):
+        options = [
+            ("solo_survivor", "Survivor", None),
+            ("solo_serial_killer", "Serial Killer", None),
+        ]
+        self.assertEqual(MafiaBot._choose_idea_pick(options), "solo_survivor")
+
+    def test_choose_idea_pick_prefers_serial_killer_over_group_scum(self):
+        options = [
+            ("mafia_goon", "Mafia Goon", "Mafia"),
+            ("solo_serial_killer", "Serial Killer", None),
+        ]
+        self.assertEqual(MafiaBot._choose_idea_pick(options), "solo_serial_killer")
+
+    def test_choose_idea_pick_prefers_town_over_third_party(self):
+        options = [
+            ("solo_survivor", "Survivor", None),
+            ("vt", "Vanilla Townie", "Town"),
+        ]
+        self.assertEqual(MafiaBot._choose_idea_pick(options), "vt")
+
+    def test_choose_idea_pick_treats_werewolf_alien_cult_goo_as_group_scum(self):
+        for role_name, alignment in [
+            ("Werewolf Roleblocker", "Werewolf"),
+            ("Alien Contrary", "Alien"),
+            ("Cult Leader", None),
+            ("Day 2 Suicidal Cult One-Shot Goomaker", None),
+            ("Replicant Roleblocker", None),
+        ]:
+            options = [
+                ("scum_role", role_name, alignment),
+                ("solo_survivor", "Survivor", None),
+            ]
+            self.assertEqual(
+                MafiaBot._choose_idea_pick(options), "solo_survivor", msg=f"role={role_name}"
+            )
+
+    def test_classify_idea_option_named_third_party_roles(self):
+        for role_name in [
+            "Judas", "Saulus", "Survivor", "1-Shot Townie", "Underdog", "Wild Card",
+            "Wild Card GI",  # a suffixed variant seen in real IDEA role lists
+        ]:
+            self.assertEqual(
+                MafiaBot._classify_idea_option(role_name, None), 2, msg=f"role={role_name}"
+            )
 
     def test_maybe_pick_idea_role_sends_ideapick_command_for_town_option(self):
         bot = MafiaBot.__new__(MafiaBot)
         bot.tracker = GameTracker()
-        bot._idea_picked = False
+        bot._idea_last_candidates = None
         bot.send_room_command = AsyncMock()
 
         line = (
@@ -649,22 +729,48 @@ class TestBotComponents(unittest.TestCase):
         asyncio.run(bot._maybe_pick_idea_role(line))
 
         bot.send_room_command.assert_called_once_with("/mafia ideapick role, day2suicidalbulletproofpurplegoo")
-        self.assertTrue(bot._idea_picked)
+        self.assertEqual(
+            bot._idea_last_candidates,
+            frozenset({"day2suicidalbulletproofpurplegoo", "mafiaoneshotstrongman"}),
+        )
 
-    def test_maybe_pick_idea_role_only_picks_once(self):
+    def test_maybe_pick_idea_role_skips_when_same_round_already_acted_on(self):
+        # Post-pick panel state: the chosen option is now disabled/dropped
+        # out, only the other original option ("bar") still shows as
+        # clickable -- a subset of the round already acted on, not new.
         bot = MafiaBot.__new__(MafiaBot)
         bot.tracker = GameTracker()
-        bot._idea_picked = True
+        bot._idea_last_candidates = frozenset({"foo", "bar"})
         bot.send_room_command = AsyncMock()
 
         line = (
             '|pagehtml|<div><p><b>IDEA information:</b><br /><b>role:</b> '
-            '<button class="button" name="send" value="/msgroom mafia,/mafia ideapick role, foo">Foo</button></p></div>'
+            '<button class="button" name="send" value="/msgroom mafia,/mafia ideapick role, bar">Bar</button></p></div>'
         )
 
         asyncio.run(bot._maybe_pick_idea_role(line))
 
         bot.send_room_command.assert_not_called()
+
+    def test_maybe_pick_idea_role_reacts_to_a_new_round_with_different_options(self):
+        # A game can run through more than one IDEA round -- a fresh set
+        # of options (not overlapping with the last round acted on)
+        # should be picked again, not permanently ignored.
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = GameTracker()
+        bot._idea_last_candidates = frozenset({"foo", "bar"})
+        bot.send_room_command = AsyncMock()
+
+        line = (
+            '|pagehtml|<div><p><b>IDEA information:</b><br /><b>role:</b> '
+            '<button class="button" name="send" value="/msgroom mafia,/mafia ideapick role, baz">Baz</button>'
+            '<button class="button" name="send" value="/msgroom mafia,/mafia ideapick role, qux">Qux</button></p></div>'
+        )
+
+        asyncio.run(bot._maybe_pick_idea_role(line))
+
+        bot.send_room_command.assert_called_once_with("/mafia ideapick role, baz")
+        self.assertEqual(bot._idea_last_candidates, frozenset({"baz", "qux"}))
 
     def test_maybe_react_to_clanker_reacts_and_shifts_vote_during_day(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -761,6 +867,36 @@ class TestBotComponents(unittest.TestCase):
 
         bot._send_chat_message.assert_not_called()
         bot.send_room_command.assert_not_called()
+
+    def test_evaluate_and_vote_skips_when_already_in_progress(self):
+        # Confirmed live: model inference plus optional comment delays can
+        # take several seconds, and _evaluate_and_vote gets triggered from
+        # more than one place (day start, deadline warnings) -- a second
+        # call arriving before the first finishes must not re-run the
+        # whole evaluation (that used to send the same read/vote twice).
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(state="DAY", eliminated=False, in_game=True)
+        bot.tracker.get_game_session = Mock(return_value=GameSession(source="test", raw_text="", players=["Alice"]))
+        bot._evaluating_vote = True
+        bot._evaluate_and_vote_impl = AsyncMock()
+
+        asyncio.run(bot._evaluate_and_vote())
+
+        bot._evaluate_and_vote_impl.assert_not_awaited()
+
+    def test_evaluate_and_vote_clears_guard_after_running(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        session = GameSession(source="test", raw_text="", players=["Alice"])
+        bot.tracker = SimpleNamespace(
+            state="DAY", eliminated=False, in_game=True, get_game_session=Mock(return_value=session)
+        )
+        bot._evaluating_vote = False
+        bot._evaluate_and_vote_impl = AsyncMock()
+
+        asyncio.run(bot._evaluate_and_vote())
+
+        bot._evaluate_and_vote_impl.assert_awaited_once_with(False, session)
+        self.assertFalse(bot._evaluating_vote)
 
     def test_evaluate_and_vote_uses_default_confidence_when_not_volo(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -1572,6 +1708,17 @@ class TestBotComponents(unittest.TestCase):
 
         bot.send_room_command.assert_any_call("/mafia vote Alice")
 
+    def test_delayed_vote_reaction_sends_a_catchphrase(self):
+        bot = MafiaBot.__new__(MafiaBot)
+        bot._send_chat_message = AsyncMock()
+
+        with patch("mafia_framework.bot.client.asyncio.sleep", new=AsyncMock()), \
+             patch("random.uniform", return_value=3.0), \
+             patch("random.choice", side_effect=lambda pool: pool[0]):
+            asyncio.run(bot._delayed_vote_reaction("|c:|123|~|Alice has voted BotUser."))
+
+        bot._send_chat_message.assert_awaited_once_with("why me")
+
     def test_vote_detection_for_bot_username(self):
         self.assertTrue(MafiaBot._is_vote_for_bot("|c:|123|~|Alice has voted BotUser.", "BotUser"))
         self.assertTrue(MafiaBot._is_vote_for_bot("|c:|123|~|Alice voted for bot-user", "BotUser"))
@@ -1796,6 +1943,27 @@ class TestBotComponents(unittest.TestCase):
 
         bot._send_chat_message.assert_not_awaited()
         bot.connection.send.assert_not_awaited()
+
+    def test_handle_pm_speak_refuses_a_line_starting_with_slash(self):
+        # Confirmed live: Showdown treats a room message starting with "/"
+        # as a slash command, not chat text -- send_room_command can't
+        # tell the difference, so this must be blocked before it ever
+        # reaches _send_chat_message, or any PM sender could make the bot
+        # execute arbitrary commands (a player got it to send a real /pm
+        # this way before this fix).
+        bot = MafiaBot.__new__(MafiaBot)
+        bot.tracker = SimpleNamespace(in_game=True, eliminated=False, players=["Alice"], dead_players=set())
+        bot.config = SimpleNamespace(showdown=SimpleNamespace(username="BotUser"))
+        bot.connection = Mock()
+        bot.connection.send = AsyncMock()
+        bot._send_chat_message = AsyncMock()
+
+        asyncio.run(bot._handle_pm("Alice", ".speak /pm someone, do something"))
+
+        bot._send_chat_message.assert_not_awaited()
+        bot.connection.send.assert_awaited_once()
+        sent_pm = bot.connection.send.call_args[0][0]
+        self.assertIn("can't start a spoken line with '/'", sent_pm)
 
     def test_handle_pm_claim_uses_own_role(self):
         bot = MafiaBot.__new__(MafiaBot)
@@ -2233,19 +2401,33 @@ class TestBotComponents(unittest.TestCase):
         self.assertIn("BotUser", tracker.players)
 
     def test_duplicate_roster_broadcast_does_not_refire_started(self):
-        # Seen live: the room re-broadcasts the exact same "**Players (N)**:"
-        # line twice around game start (once at roster lock, once at the
-        # actual start). The second one must not look like a brand new game.
+        # A "**Players (N)**:" roster snapshot alone is just a roster
+        # update now -- it never fires STARTED by itself (only the
+        # explicit "game is starting" announcement does), so repeating it
+        # is naturally harmless.
         tracker = GameTracker()
+        tracker.state = "SIGNUPS"
         roster_line = "|c:|123|~|**Players (2)**: Alice, BotUser"
 
         first_event = tracker.process_message(roster_line, bot_username="BotUser")
-        self.assertEqual(first_event, "STARTED")
+        self.assertIsNone(first_event)
 
         second_event = tracker.process_message(roster_line, bot_username="BotUser")
         self.assertIsNone(second_event)
         self.assertEqual(tracker.players, ["Alice", "BotUser"])
+
+        start_event = tracker.process_message(
+            "|raw|<div class=\"broadcast-blue\">The game of Mafia is starting!</div>", bot_username="BotUser"
+        )
+        self.assertEqual(start_event, "STARTED")
         self.assertTrue(tracker.in_game)
+
+        # A repeat of the explicit start announcement (state is no longer
+        # SIGNUPS) must not look like a brand new game either.
+        repeat_start_event = tracker.process_message(
+            "|raw|<div class=\"broadcast-blue\">The game of Mafia is starting!</div>", bot_username="BotUser"
+        )
+        self.assertIsNone(repeat_start_event)
 
     def test_duplicate_game_end_message_does_not_refire_finished(self):
         # Seen live: the room can send more than one "game has ended"-shaped
@@ -2314,6 +2496,7 @@ class TestBotComponents(unittest.TestCase):
         # in_game back to False, breaking every subsequent vote reaction,
         # claim, and night action for a game the bot was still actually in.
         tracker = GameTracker()
+        tracker.state = "SIGNUPS"
         roster_line = "|c:|123|~|**Players (3)**: Alice, Bob, BotUser"
         spectate_line = (
             '|c:|124|~|/uhtml mafia,<div class="broadcast-blue">'
@@ -2322,7 +2505,10 @@ class TestBotComponents(unittest.TestCase):
             '<button class="button" name="send" value="/join view-mafia-mafia">Spectate the game</button></p></div>'
         )
 
-        event = tracker.process_message(roster_line, bot_username="BotUser")
+        tracker.process_message(roster_line, bot_username="BotUser")
+        event = tracker.process_message(
+            "|raw|<div class=\"broadcast-blue\">The game of Mafia is starting!</div>", bot_username="BotUser"
+        )
         self.assertEqual(event, "STARTED")
         self.assertTrue(tracker.in_game)
 
@@ -2346,6 +2532,53 @@ class TestBotComponents(unittest.TestCase):
         self.assertIsNone(event)
         self.assertFalse(tracker.in_game)
 
+    def test_roster_alone_does_not_start_the_game(self):
+        # Reported live: the bot was voting/announcing town reads before
+        # "The game of Mafia is starting!" ever appeared, because a
+        # "Players (N):" roster snapshot alone used to be treated as the
+        # game start. Only the explicit announcement may do that.
+        tracker = GameTracker()
+        tracker.state = "SIGNUPS"
+
+        event = tracker.process_message(
+            "|c:|123|~|**Players (3)**: Alice, Bob, BotUser", bot_username="BotUser"
+        )
+
+        self.assertIsNone(event)
+        self.assertEqual(tracker.state, "SIGNUPS")
+        self.assertFalse(tracker.in_game)
+        self.assertEqual(tracker.players, ["Alice", "Bob", "BotUser"])
+
+    def test_get_game_session_reflects_a_sub_not_the_stale_original_roster(self):
+        # Reported live: after "A Flowers Dream has been subbed out.
+        # Werewolf has joined the game." (the real combined broadcast text
+        # for a sub), tracker.players correctly updated, but session.players
+        # -- what predictions/reads actually use -- kept the original,
+        # departed player's name. That's because get_game_session re-parses
+        # the accumulated raw text, which still contains the original
+        # "Players (N): ..." roster line, and used to only fall back to
+        # tracker.players when that re-parse came up empty (which it never
+        # did, since the stale roster line is always still in there).
+        tracker = GameTracker()
+        tracker.bot_username = "BotUser"
+        tracker.state = "SIGNUPS"
+        tracker.process_message(
+            "|c:|1|~|**Players (3)**: A Flowers Dream, Aziziller, BotUser", bot_username="BotUser"
+        )
+        tracker.process_message(
+            "|c:|2|~|The game of Mafia is starting!", bot_username="BotUser"
+        )
+
+        tracker.process_message(
+            '|raw|<div class="broadcast-blue">A Flowers Dream has been subbed out. '
+            "Werewolf has joined the game.</div>",
+            bot_username="BotUser",
+        )
+
+        self.assertEqual(tracker.players, ["Werewolf", "Aziziller", "BotUser"])
+        session = tracker.get_game_session()
+        self.assertEqual(session.players, ["Werewolf", "Aziziller", "BotUser"])
+
     def test_roster_lock_does_not_immediately_count_as_day(self):
         # Seen live: roster lock is followed by a rolling/role-distribution
         # period ("Night 0") before Day 1 actually starts. Treating the
@@ -2353,9 +2586,13 @@ class TestBotComponents(unittest.TestCase):
         # (filler/reactions/questions, all gated on state == "DAY") before
         # the game itself had really started.
         tracker = GameTracker()
+        tracker.state = "SIGNUPS"
 
-        event = tracker.process_message(
+        tracker.process_message(
             "|c:|123|~|**Players (3)**: Alice, Bob, BotUser", bot_username="BotUser"
+        )
+        event = tracker.process_message(
+            "|raw|<div class=\"broadcast-blue\">The game of Mafia is starting!</div>", bot_username="BotUser"
         )
         self.assertEqual(event, "STARTED")
         self.assertNotEqual(tracker.state, "DAY")

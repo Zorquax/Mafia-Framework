@@ -35,6 +35,18 @@ LIE_AS_VT_ROLE_RE = re.compile(
     r"\b(mafia|werewolf|alien|cult\w*|serial\s+killer|goo|solo|condemner|replicant)\b", re.IGNORECASE
 )
 
+# IDEA pick priority (see _classify_idea_option): group-scum keywords for
+# the lowest-priority tier -- "goo\w*" (not bare "goo") so it also catches
+# fused role names like "Goomaker", not just a standalone "Goo".
+OTHER_SCUM_GROUP_RE = re.compile(r"\b(mafia|werewolf|alien|cult\w*|goo\w*|replicant)\b", re.IGNORECASE)
+
+# IDEA pick priority: named third-party/neutral roles -- checked explicitly
+# by name rather than relying only on the "no recognized alignment" default,
+# since these use varied flavor text for their win condition.
+THIRD_PARTY_ROLE_RE = re.compile(
+    r"\b(judas|saulus|survivor|1[\s-]*shot\s+townie|underdog|wild\s+card)\b", re.IGNORECASE
+)
+
 VALID_ALIGNMENTS = {"town", "mafia", "neutral", "unknown"}
 
 # Popcorn's gun-holder mechanic: matches the death/role-reveal broadcast,
@@ -152,12 +164,13 @@ class MafiaBot:
         self._own_role: Optional[str] = None
         self._claimed_this_day: bool = False
         self._has_gun: bool = False
-        self._idea_picked: bool = False
+        self._idea_last_candidates: Optional[frozenset[str]] = None
         self._defended_plurality_target: Optional[str] = None
         self._main_task: Optional[asyncio.Task] = None
         self._random_actions_task: Optional[asyncio.Task] = None
         self._ready_for_live_games: bool = False
         self._remembered_lines: list[str] = []
+        self._evaluating_vote: bool = False
 
     @staticmethod
     def _message_text_from_line(line: str) -> str:
@@ -741,6 +754,38 @@ class MafiaBot:
             await asyncio.sleep(delay)
         await self.send_room_command("/mafia join")
 
+    async def _delayed_vote_reaction(self, line: str) -> None:
+        """Reacts to being voted with a delayed catchphrase, run as a
+        background task rather than awaited inline in the message loop --
+        confirmed live, awaiting this multi-second delay directly in the
+        loop stalled processing of every other queued message (including
+        other players' own votes) until it finished, making several
+        distinct vote events fire in a bunched-up burst all at once
+        instead of as they actually happened.
+        """
+        delay = random.uniform(2.0, 5.0)
+        logger.info(f"Delayed vote reaction by {delay:.2f}s")
+        await asyncio.sleep(delay)
+        voter = self._extract_vote_voter_name(line)
+        catchphrases = [
+            "why me",
+            "im town",
+            "bruh",
+            "they're gonna qh",
+            "dude you have to trust me here",
+            "this is a bad vote",
+            "wrong read",
+            "im not it chief",
+            "big mistake voting me",
+            "cmon really",
+            "yall are wasting time on me",
+            "not it",
+        ]
+        if voter:
+            catchphrases.append(f"get off me {voter}")
+            catchphrases.append(f"{voter} explain this vote")
+        await self._send_chat_message(random.choice(catchphrases))
+
     async def _delayed_game_end_chat(self, ragebait_message: Optional[str]) -> None:
         """Waits the same auto-action delay as autojoin before saying gg --
         reacting the instant a game ends is as much a bot tell as joining
@@ -822,9 +867,6 @@ class MafiaBot:
 
                     event = self.tracker.process_message(line, bot_username=self.config.showdown.username)
                     self._maybe_remember_chat_line(line)
-                    if event == "SIGNUPS" and self.config.gameplay.autojoin:
-                        logger.info("Autojoining Mafia game from live room update...")
-                        asyncio.create_task(self._delayed_autojoin())
 
                     if self._ready_for_live_games and not self.config.gameplay.silent_mode:
                         me_match = self._extract_me_action(line, self.config.showdown.username)
@@ -846,28 +888,7 @@ class MafiaBot:
                         and self._is_vote_for_bot(line, self.config.showdown.username)
                         and random.random() < self.config.gameplay.vote_reaction_chance
                     ):
-                        delay = random.uniform(2.0, 5.0)
-                        logger.info(f"Delayed vote reaction by {delay:.2f}s")
-                        await asyncio.sleep(delay)
-                        voter = self._extract_vote_voter_name(line)
-                        catchphrases = [
-                            "why me",
-                            "im town",
-                            "bruh",
-                            "they're gonna qh",
-                            "dude you have to trust me here",
-                            "this is a bad vote",
-                            "wrong read",
-                            "im not it chief",
-                            "big mistake voting me",
-                            "cmon really",
-                            "yall are wasting time on me",
-                            "not it",
-                        ]
-                        if voter:
-                            catchphrases.append(f"get off me {voter}")
-                            catchphrases.append(f"{voter} explain this vote")
-                        await self._send_chat_message(random.choice(catchphrases))
+                        asyncio.create_task(self._delayed_vote_reaction(line))
 
                     if (
                         self._ready_for_live_games
@@ -911,7 +932,7 @@ class MafiaBot:
             self._own_role = None
             self._claimed_this_day = False
             self._has_gun = False
-            self._idea_picked = False
+            self._idea_last_candidates = None
             self._defended_plurality_target = None
             # A line remembered before this game started (signups chatter,
             # or leftover from a previous game) isn't commentary on anything
@@ -1013,7 +1034,7 @@ class MafiaBot:
             self._own_role = None
             self._claimed_this_day = False
             self._has_gun = False
-            self._idea_picked = False
+            self._idea_last_candidates = None
             self._defended_plurality_target = None
 
     def _build_question_prompt(self, session) -> Optional[str]:
@@ -1306,37 +1327,75 @@ class MafiaBot:
             logger.info("Detected this bot now holds the Popcorn gun; will shoot scumreads instead of voting.")
 
     @staticmethod
-    def _choose_idea_pick(options: list[tuple[str, str, Optional[str]]]) -> Optional[str]:
-        """Picks a Town-aligned option out of an IDEA module's remaining
-        choices, avoiding anything confirmed Mafia-aligned. Falls back to
-        any not-confirmed-Mafia option (alignment unclear, e.g. a solo
-        "aligned with yourself" role) if no Town option is offered, and
-        gives up (returns None, leaving the pick to whatever the game does
-        by default) only if every option is confirmed Mafia.
+    def _classify_idea_option(role_name: str, alignment: Optional[str]) -> int:
+        """Priority tier for an IDEA option -- lower picks first:
+        1) Town
+        2) Third-party / neutral -- named roles (Judas, Saulus, Survivor,
+           1-Shot Townie, Underdog, Wild Card), or any other unrecognized
+           alignment (e.g. a solo "aligned with yourself" wincon)
+        3) Serial Killer
+        4) Any other group-scum alignment (Mafia/Werewolf/Alien/Cult/
+           Goo/Replicant)
+
+        Serial Killer, the named third-party roles, and the group-scum
+        keywords are all checked against the role name itself (not just
+        the parsed alignment span), since these often only have "aligned
+        with yourself" wincon text with no clean alignment word to match.
         """
-        town_options = [opt for opt in options if (opt[2] or "").lower() == "town"]
-        if town_options:
-            return town_options[0][0]
+        alignment_lower = (alignment or "").lower()
+        name_lower = role_name.lower()
 
-        safe_options = [opt for opt in options if (opt[2] or "").lower() != "mafia"]
-        if safe_options:
-            return safe_options[0][0]
+        if alignment_lower == "town":
+            return 1
+        if "serial killer" in name_lower or alignment_lower == "serial killer":
+            return 3
+        if THIRD_PARTY_ROLE_RE.search(name_lower):
+            return 2
+        if alignment_lower in {"mafia", "werewolf", "alien", "cult"} or OTHER_SCUM_GROUP_RE.search(name_lower):
+            return 4
+        return 2
 
-        return None
+    @staticmethod
+    def _choose_idea_pick(options: list[tuple[str, str, Optional[str]]]) -> Optional[str]:
+        """Picks the best-tiered option out of an IDEA module's remaining
+        choices, per _classify_idea_option's priority order. Always picks
+        something (from whatever tier is actually available) rather than
+        giving up, even if every option is group-scum -- that's still the
+        pick order asked for, just the least-preferred tier.
+        """
+        if not options:
+            return None
+
+        ranked = sorted(options, key=lambda opt: MafiaBot._classify_idea_option(opt[1], opt[2]))
+        return ranked[0][0]
 
     async def _maybe_pick_idea_role(self, line: str) -> None:
-        if getattr(self, "_idea_picked", False):
-            return
+        """A game can run through more than one IDEA round (e.g. a fresh
+        set of options after an earlier pick, not just one pick for the
+        whole game) -- so this reacts to the *set* of currently-offered
+        role ids changing, rather than a one-shot "already picked" flag.
 
+        After a successful pick, the panel naturally still shows the
+        remaining un-chosen option(s) as clickable (only the bot's own
+        pick becomes disabled and drops out) -- that shrunk set is a
+        subset of the one just acted on, so it's recognized as the same
+        round rather than a new one to re-decide.
+        """
         options = self.tracker.parse_idea_options_if_present(line)
         if not options:
             return
+
+        candidate_ids = frozenset(role_id for role_id, _, _ in options)
+        last_ids = getattr(self, "_idea_last_candidates", None)
+        if last_ids and candidate_ids <= last_ids:
+            return
+
+        self._idea_last_candidates = candidate_ids
 
         choice = self._choose_idea_pick(options)
         if not choice:
             return
 
-        self._idea_picked = True
         role_names = [name for _, name, _ in options]
         logger.info(f"IDEA pick: choosing role id '{choice}' from options {role_names}.")
         await self.send_room_command(f"/mafia ideapick role, {choice}")
@@ -1389,6 +1448,24 @@ class MafiaBot:
             logger.info("Bot is not participating in the current game. Skipping vote evaluation.")
             return
 
+        if getattr(self, "_evaluating_vote", False):
+            # Model inference plus optional comment delays can take several
+            # seconds, and this gets triggered from more than one place (day
+            # start, deadline warnings). Without this guard, a second trigger
+            # firing before the first finishes updating _current_vote_target/
+            # _current_town_read saw stale state and re-announced the exact
+            # same read/vote a few seconds after the first one -- confirmed
+            # live (e.g. "NeonTeal is town" sent twice, 8s apart, both
+            # logging "Previous: None").
+            logger.info("Vote evaluation already in progress; skipping overlapping call.")
+            return
+        self._evaluating_vote = True
+        try:
+            await self._evaluate_and_vote_impl(allow_random_fallback, session)
+        finally:
+            self._evaluating_vote = False
+
+    async def _evaluate_and_vote_impl(self, allow_random_fallback: bool, session) -> None:
         is_modexe = self._is_modexe_theme()
         has_gun = getattr(self, "_has_gun", False) and self._is_popcorn_theme()
         # MYLO's "a wrong lynch can lose the game" logic assumes a normal
@@ -1655,6 +1732,18 @@ class MafiaBot:
             # what was actually typed survives instead of being collapsed.
             line_to_speak = msg.strip()[len(parts[0]):].strip()
             if line_to_speak:
+                # Confirmed live (exploited within minutes of shipping this
+                # command): Showdown treats any room message starting with
+                # "/" as a slash command, not chat text -- send_room_command
+                # has no way to distinguish, so a leading "/" here would let
+                # any PM sender make the bot execute arbitrary commands
+                # (confirmed: got it to send a real /pm on their behalf).
+                # Refuse outright rather than trying to escape it.
+                if line_to_speak.startswith("/"):
+                    await self.connection.send(
+                        f"|/pm {clean_sender}, can't start a spoken line with '/' -- that would run as a command, not chat."
+                    )
+                    return
                 logger.info(f"Speaking on request from {clean_sender}: {line_to_speak}")
                 await self._send_chat_message(line_to_speak)
                 await self.connection.send(f"|/pm {clean_sender}, said: {line_to_speak}")

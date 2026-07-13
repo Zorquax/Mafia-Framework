@@ -43,6 +43,14 @@ SPECTATE_STATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The explicit, authoritative "the game has actually begun" announcement --
+# confirmed live: "The game of Mafia is starting!" followed by "The roles
+# have been distributed.". A "Players (N): ..." roster snapshot can appear
+# earlier too (e.g. at signups-lock, before roles are even distributed),
+# so that alone must never be treated as the real game start -- only this
+# explicit announcement does.
+GAME_STARTING_RE = re.compile(r"The\s+game\s+of\s+Mafia\s+is\s+starting", re.IGNORECASE)
+
 # Regex to detect night phase start. Some hosts/rulesets phrase this as
 # "Night 2. Submit whether you are using an action or idle..." (confirmed
 # live) or "It's night in the game of Mafia! Send in an action or idle."
@@ -195,7 +203,9 @@ class GameTracker:
         Processes a single chat/system message line from the target room.
         Returns:
             - "SIGNUPS" if signup phase started.
-            - "STARTED" if game started (roster announced).
+            - "STARTED" if the game actually started (explicit "the game
+              of Mafia is starting" announcement, not just a roster
+              snapshot -- see GAME_STARTING_RE).
             - "DAY" if day phase started.
             - "NIGHT" if night phase started.
             - "FINISHED" if the game ended.
@@ -286,37 +296,36 @@ class GameTracker:
                 logger.info("Detected spectate-only mafia state; bot is not participating.")
             return None
 
-        # Check for player roster list (signifies game start / active players)
+        # Check for player roster list -- tracks the current roster, but
+        # does NOT by itself mean the game has started. A roster snapshot
+        # like this can appear at signups-lock, before roles are even
+        # distributed -- only the explicit GAME_STARTING_RE announcement
+        # below actually flips SIGNUPS into an active game.
         players_match = PLAYERS_LIST_RE.search(line)
         if players_match:
-            # Re-parse players list using the existing helper
             from ..io.parser import parse_players_list
             parsed_players = parse_players_list(line)
             if parsed_players:
-                if parsed_players == self.players and self.state in {"DAY", "NIGHT"}:
-                    # The room sometimes re-broadcasts the exact same roster
-                    # line twice around game start (e.g. once at roster
-                    # lock, once when the game actually begins) -- treating
-                    # a byte-identical repeat as a brand new game would
-                    # re-fire every per-game reset (claimed_this_day,
-                    # current vote/town read, remembered lines) mid-game.
-                    self.accumulated_lines.append(line)
-                    return None
                 self.players = parsed_players
-                # Roster lock doesn't mean Day 1 has actually begun -- there's
-                # a rolling/role-distribution period (often shown as "Night
-                # 0") before the real "Day 1. The hammer count is set at..."
-                # marker arrives. Treating that gap as already "DAY" made the
-                # bot start chatting (filler, reactions, questions) before
-                # the game had actually started. NIGHT is a closer fit --
-                # nothing here talks during NIGHT -- and the real DAY_MARKER_RE
-                # match below flips it to DAY for real once Day 1 starts.
-                self.state = "NIGHT"
                 self.accumulated_lines.append(line)
-                self.in_game = self._is_bot_on_roster(bot_username)
-                self.eliminated = False
-                logger.info(f"Detected game start with players: {self.players} (in_game={self.in_game})")
-                return "STARTED"
+                logger.info(f"Updated player roster: {self.players}")
+                return None
+
+        if self.state == "SIGNUPS" and GAME_STARTING_RE.search(clean_text):
+            # Roster lock doesn't mean Day 1 has actually begun -- there's
+            # a rolling/role-distribution period (often shown as "Night
+            # 0") before the real "Day 1. The hammer count is set at..."
+            # marker arrives. Treating that gap as already "DAY" made the
+            # bot start chatting (filler, reactions, questions) before
+            # the game had actually started. NIGHT is a closer fit --
+            # nothing here talks during NIGHT -- and the real DAY_MARKER_RE
+            # match below flips it to DAY for real once Day 1 starts.
+            self.state = "NIGHT"
+            self.accumulated_lines.append(line)
+            self.in_game = self._is_bot_on_roster(bot_username)
+            self.eliminated = False
+            logger.info(f"Detected game start with players: {self.players} (in_game={self.in_game})")
+            return "STARTED"
 
         # If a game is active (not IDLE or SIGNUPS)
         if self.state in {"DAY", "NIGHT"}:
@@ -375,6 +384,15 @@ class GameTracker:
 
             # Check for night marker
             if NIGHT_START_RE.search(clean_text):
+                if self.state == "NIGHT":
+                    # Already handled -- some hosts send more than one
+                    # night-shaped message for the same transition (e.g.
+                    # both "It's night in the game of Mafia!" and "Night
+                    # 2. Submit whether..." for one night), and this check
+                    # runs unconditionally on every message. Without this
+                    # guard each one re-fired NIGHT, causing the idle/kill
+                    # action to be sent multiple times for one night.
+                    return None
                 self.state = "NIGHT"
                 logger.info("Phase change: Night started.")
                 return "NIGHT"
@@ -596,7 +614,14 @@ class GameTracker:
         raw_text = "\n".join(normalized_lines)
         session = parse_showdown_log(raw_text, source="live_bot")
         session.flips = extract_flips(raw_text)
-        # Ensure players are loaded
-        if not session.players:
+        # self.players is the authoritative, continuously-updated roster --
+        # it reflects subs (see _handle_substitutions), which re-parsing the
+        # accumulated raw text can't: that text still contains the original
+        # "Players (N): ..." announcement with the departed player's name,
+        # so parse_showdown_log would always find a non-empty (but stale)
+        # roster there and this used to never get overridden. Confirmed
+        # live: predictions/reads kept naming a player who had already been
+        # subbed out for their replacement.
+        if self.players:
             session.players = list(self.players)
         return session
